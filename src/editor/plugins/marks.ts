@@ -958,7 +958,7 @@ export function setEventCallback(cb: (event: string, data: Record<string, unknow
   _eventCallback = cb;
 }
 
-function emitMarkEvent(event: string, data: Record<string, unknown>): void {
+export function emitMarkEvent(event: string, data: Record<string, unknown>): void {
   if (_eventCallback) {
     try { _eventCallback(event, data); } catch (e) { console.warn('[marks] event emit error:', e); }
   }

@@ -16,6 +16,7 @@ import {
   setActiveMark,
   setComposeAnchorRange,
   suggestReplace,
+  emitMarkEvent,
   type MarkRange,
 } from './marks';
 import {
@@ -774,6 +775,9 @@ class MarkPopoverController {
 
     if (mark.kind === 'comment') {
       this.renderThread(mark);
+      const commentData = mark.data as { replies?: unknown[] } | undefined;
+      const replyCount = commentData?.replies?.length ?? 0;
+      emitMarkEvent('thread.read', { markId, replyCount });
     } else {
       this.renderSuggestion(mark);
     }
@@ -1096,6 +1100,16 @@ class MarkPopoverController {
         if ((event.key === 'Enter' && event.metaKey) || (this.renderMode === 'mobile-sheet' && event.key === 'Enter' && !event.shiftKey)) {
           event.preventDefault();
           reply();
+          this.close();
+        }
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          event.stopPropagation();
+          if (replyBox.value.trim()) {
+            replyBox.value = '';
+          } else {
+            this.close();
+          }
         }
       });
 
