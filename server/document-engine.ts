@@ -9,6 +9,7 @@ import {
   upsertMarkTombstone,
   updateDocumentAtomic,
   updateMarks,
+  upsertThreadReadCursor,
 } from './db.js';
 import { refreshSnapshotForSlug } from './snapshot.js';
 import {
@@ -1307,7 +1308,11 @@ function replyComment(slug: string, body: JsonRecord): EngineExecutionResult {
   const baseReplies = normalizedReplies.length >= threadReplies.length ? normalizedReplies : threadReplies;
   const replies = [...baseReplies, { by, text, at: new Date().toISOString() }];
   marks[markId] = { ...existing, thread: replies, replies, threadId: existing.threadId ?? markId };
-  return persistMarks(slug, marks, by, 'comment.replied', { markId, by, text });
+  const result = persistMarks(slug, marks, by, 'comment.replied', { markId, by, text });
+  if (result.status === 200) {
+    upsertThreadReadCursor(slug, markId, by, replies.length - 1);
+  }
+  return result;
 }
 
 function rewriteDocument(slug: string, body: JsonRecord): EngineExecutionResult {

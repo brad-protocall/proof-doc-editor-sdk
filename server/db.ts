@@ -960,6 +960,18 @@ function initDatabase(): void {
     )
   `);
   d.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_library_documents_slug ON library_documents(document_slug)');
+
+  d.exec(`
+    CREATE TABLE IF NOT EXISTS thread_read_cursors (
+      document_slug TEXT NOT NULL,
+      mark_id TEXT NOT NULL,
+      actor TEXT NOT NULL,
+      last_read_index INTEGER NOT NULL DEFAULT -1,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (document_slug, mark_id, actor)
+    )
+  `);
+  d.exec('CREATE INDEX IF NOT EXISTS idx_trc_actor_slug ON thread_read_cursors(actor, document_slug)');
 }
 
 export function createDocument(
@@ -1808,6 +1820,49 @@ export function ackDocumentEvents(slug: string, upToId: number, ackedBy: string)
     WHERE document_slug = ? AND id <= ? AND acked_at IS NULL
   `).run(ackedBy, now, slug, upToId);
   return result.changes;
+}
+
+// ---------------------------------------------------------------------------
+// Thread Read Cursors
+// ---------------------------------------------------------------------------
+
+export function upsertThreadReadCursor(
+  slug: string,
+  markId: string,
+  actor: string,
+  lastReadIndex: number,
+): void {
+  assertWritesAllowed('upsertThreadReadCursor');
+  const now = new Date().toISOString();
+  getDb().prepare(`
+    INSERT INTO thread_read_cursors (document_slug, mark_id, actor, last_read_index, updated_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT (document_slug, mark_id, actor) DO UPDATE SET
+      last_read_index = MAX(thread_read_cursors.last_read_index, excluded.last_read_index),
+      updated_at = excluded.updated_at
+  `).run(slug, markId, actor, lastReadIndex, now);
+}
+
+export function getThreadReadCursors(
+  slug: string,
+  actor: string,
+): Array<{ mark_id: string; last_read_index: number }> {
+  return getDb().prepare(`
+    SELECT mark_id, last_read_index FROM thread_read_cursors
+    WHERE document_slug = ? AND actor = ?
+  `).all(slug, actor) as Array<{ mark_id: string; last_read_index: number }>;
+}
+
+export function getThreadReadCursor(
+  slug: string,
+  markId: string,
+  actor: string,
+): number | null {
+  const row = getDb().prepare(`
+    SELECT last_read_index FROM thread_read_cursors
+    WHERE document_slug = ? AND mark_id = ? AND actor = ?
+  `).get(slug, markId, actor) as { last_read_index: number } | undefined;
+  return row?.last_read_index ?? null;
 }
 
 export function createDocumentAccessToken(

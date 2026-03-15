@@ -13,6 +13,8 @@ import {
   updateDocument,
   updateDocumentAtomic,
   updateDocumentAtomicByRevision,
+  upsertThreadReadCursor,
+  getThreadReadCursors,
 } from './db.js';
 import {
   applyAgentPresenceToLoadedCollab,
@@ -438,6 +440,7 @@ function storeIdempotentMutationResult(
 function routeRequiresMutation(method: string, path: string): boolean {
   if (method !== 'POST') return false;
   if (path === '/events/ack' || path.endsWith('/events/ack')) return false;
+  if (path === '/threads/read' || path.endsWith('/threads/read')) return false;
   return true;
 }
 
@@ -2472,6 +2475,95 @@ agentRoutes.post('/:slug/events/ack', (req: Request, res: Response) => {
   const by = typeof payload.by === 'string' && payload.by.trim() ? payload.by.trim() : 'owner';
   const acked = ackDocumentEvents(slug, Math.trunc(upToId), by);
   res.json({ success: true, acked });
+});
+
+// ---------------------------------------------------------------------------
+// Thread Read Cursors
+// ---------------------------------------------------------------------------
+
+agentRoutes.get('/:slug/threads/unread', (req: Request, res: Response) => {
+  const slug = getSlug(req);
+  if (!slug) { res.status(400).json({ success: false, error: 'Invalid slug' }); return; }
+  if (!checkAuth(req, res, slug, ['viewer', 'commenter', 'editor', 'owner_bot'])) return;
+
+  const actor = typeof req.query.actor === 'string' ? req.query.actor.trim() : '';
+  if (!actor) { res.status(400).json({ success: false, error: 'Missing actor query param' }); return; }
+
+  const doc = getDocumentBySlug(slug);
+  if (!doc) { res.status(404).json({ success: false, error: 'Document not found' }); return; }
+
+  const marks = parseCanonicalMarks(doc.marks);
+  const cursors = getThreadReadCursors(slug, actor);
+  const cursorMap = new Map(cursors.map(c => [c.mark_id, c.last_read_index]));
+
+  const unread: Array<{
+    markId: string;
+    totalReplies: number;
+    lastReadIndex: number;
+    unreadCount: number;
+    latestReplyBy: string | null;
+    latestReplyAt: string | null;
+  }> = [];
+  let totalThreads = 0;
+
+  for (const [markId, markData] of Object.entries(marks)) {
+    const mark = markData as Record<string, unknown>;
+    if (mark.kind !== 'comment' || mark.resolved === true) continue;
+    totalThreads++;
+
+    const threadReplies = Array.isArray(mark.thread) ? mark.thread as Array<{ by: string; text: string; at: string }> : [];
+    const normalizedReplies = Array.isArray(mark.replies) ? mark.replies as Array<{ by: string; text: string; at: string }> : [];
+    const replies = normalizedReplies.length >= threadReplies.length ? normalizedReplies : threadReplies;
+
+    const lastReadIndex = cursorMap.get(markId) ?? -1;
+    const unreadCount = replies.length - (lastReadIndex + 1);
+
+    if (unreadCount > 0) {
+      const latest = replies[replies.length - 1];
+      unread.push({
+        markId,
+        totalReplies: replies.length,
+        lastReadIndex,
+        unreadCount,
+        latestReplyBy: latest?.by ?? null,
+        latestReplyAt: latest?.at ?? null,
+      });
+    }
+  }
+
+  res.json({ success: true, unread, totalThreads });
+});
+
+agentRoutes.post('/:slug/threads/read', (req: Request, res: Response) => {
+  const slug = getSlug(req);
+  if (!slug) { res.status(400).json({ success: false, error: 'Invalid slug' }); return; }
+  if (!checkAuth(req, res, slug, ['commenter', 'editor', 'owner_bot'])) return;
+
+  const payload = asPayload(req.body);
+  const markId = typeof payload.markId === 'string' ? payload.markId.trim() : '';
+  if (!markId) { res.status(400).json({ success: false, error: 'Missing markId' }); return; }
+
+  // Resolve actor from body or header
+  const identity = resolveExplicitAgentIdentity(payload, req.header('x-agent-id'));
+  const actor = identity.kind === 'ok' ? identity.id
+    : typeof payload.actor === 'string' && payload.actor.trim() ? payload.actor.trim()
+    : null;
+  if (!actor) { res.status(400).json({ success: false, error: 'Missing actor (set x-agent-id header or actor in body)' }); return; }
+
+  const doc = getDocumentBySlug(slug);
+  if (!doc) { res.status(404).json({ success: false, error: 'Document not found' }); return; }
+
+  const marks = parseCanonicalMarks(doc.marks);
+  const mark = marks[markId] as Record<string, unknown> | undefined;
+  if (!mark) { res.status(404).json({ success: false, error: 'Mark not found' }); return; }
+
+  const threadReplies = Array.isArray(mark.thread) ? mark.thread as Array<unknown> : [];
+  const normalizedReplies = Array.isArray(mark.replies) ? mark.replies as Array<unknown> : [];
+  const replies = normalizedReplies.length >= threadReplies.length ? normalizedReplies : threadReplies;
+  const lastReadIndex = replies.length - 1;
+
+  upsertThreadReadCursor(slug, markId, actor, lastReadIndex);
+  res.json({ success: true, markId, lastReadIndex });
 });
 
 agentRoutes.use(async (req: Request, res: Response) => {

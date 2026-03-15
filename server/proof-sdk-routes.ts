@@ -25,6 +25,8 @@ export interface ProofSdkDocumentPaths {
   bridgeSuggestions: string;
   bridgeRewrite: string;
   bridgePresence: string;
+  threadsUnread: string;
+  threadsRead: string;
   docs: string;
 }
 
@@ -59,6 +61,8 @@ export function buildProofSdkDocumentPaths(slug: string, origin?: string): Proof
     bridgeSuggestions: withOrigin(`${base}/bridge/suggestions`, origin),
     bridgeRewrite: withOrigin(`${base}/bridge/rewrite`, origin),
     bridgePresence: withOrigin(`${base}/bridge/presence`, origin),
+    threadsUnread: withOrigin(`${base}/threads/unread`, origin),
+    threadsRead: withOrigin(`${base}/threads/read`, origin),
     docs: withOrigin(AGENT_DOCS_PATH, origin),
   };
 }
@@ -79,6 +83,10 @@ export function buildProofSdkLinks(
     state: paths.state,
     presence: { method: 'POST', href: paths.presence },
     events: paths.eventsPending,
+    threads: {
+      unread: paths.threadsUnread,
+      read: { method: 'POST', href: paths.threadsRead },
+    },
     docs: paths.docs,
   };
   if (includeMutationRoutes) {
@@ -123,6 +131,8 @@ export function buildProofSdkAgentDescriptor(
     stateApi: paths.state,
     presenceApi: paths.presence,
     eventsApi: paths.events,
+    threadsUnreadApi: paths.threadsUnread,
+    threadsReadApi: paths.threadsRead,
   };
   if (includeMutationRoutes) {
     agent.opsApi = paths.ops;
