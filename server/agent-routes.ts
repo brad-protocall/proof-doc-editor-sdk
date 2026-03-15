@@ -2486,8 +2486,11 @@ agentRoutes.get('/:slug/threads/unread', (req: Request, res: Response) => {
   if (!slug) { res.status(400).json({ success: false, error: 'Invalid slug' }); return; }
   if (!checkAuth(req, res, slug, ['viewer', 'commenter', 'editor', 'owner_bot'])) return;
 
-  const actor = typeof req.query.actor === 'string' ? req.query.actor.trim() : '';
-  if (!actor) { res.status(400).json({ success: false, error: 'Missing actor query param' }); return; }
+  const rawActor = typeof req.query.actor === 'string' ? req.query.actor.trim() : '';
+  if (!rawActor) { res.status(400).json({ success: false, error: 'Missing actor query param' }); return; }
+  if (rawActor.length > 256) { res.status(400).json({ success: false, error: 'Actor too long' }); return; }
+  // Normalize agent-scoped IDs the same way POST /threads/read does
+  const actor = normalizeAgentScopedId(rawActor) ?? rawActor;
 
   const doc = getDocumentBySlug(slug);
   if (!doc) { res.status(404).json({ success: false, error: 'Document not found' }); return; }
@@ -2542,13 +2545,16 @@ agentRoutes.post('/:slug/threads/read', (req: Request, res: Response) => {
   const payload = asPayload(req.body);
   const markId = typeof payload.markId === 'string' ? payload.markId.trim() : '';
   if (!markId) { res.status(400).json({ success: false, error: 'Missing markId' }); return; }
+  if (markId.length > 256) { res.status(400).json({ success: false, error: 'markId too long' }); return; }
 
-  // Resolve actor from body or header
+  // Resolve actor from body or header, normalizing agent-scoped IDs consistently
   const identity = resolveExplicitAgentIdentity(payload, req.header('x-agent-id'));
+  const rawFallback = typeof payload.actor === 'string' ? payload.actor.trim() : '';
   const actor = identity.kind === 'ok' ? identity.id
-    : typeof payload.actor === 'string' && payload.actor.trim() ? payload.actor.trim()
+    : rawFallback ? (normalizeAgentScopedId(rawFallback) ?? rawFallback)
     : null;
   if (!actor) { res.status(400).json({ success: false, error: 'Missing actor (set x-agent-id header or actor in body)' }); return; }
+  if (actor.length > 256) { res.status(400).json({ success: false, error: 'Actor too long' }); return; }
 
   const doc = getDocumentBySlug(slug);
   if (!doc) { res.status(404).json({ success: false, error: 'Document not found' }); return; }
