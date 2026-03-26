@@ -13,18 +13,49 @@ import {
 } from './db.js';
 import { refreshSnapshotForSlug } from './snapshot.js';
 import {
-  applyCanonicalDocumentToCollab,
+  type AuthoritativeMutationBase,
+  getCanonicalReadableDocument as getAuthoritativeCanonicalReadableDocument,
   getCanonicalReadableDocumentSync,
+  getLoadedCollabMarkdownFromFragment,
+  hasPotentiallyLiveCollabDoc,
   invalidateCollabDocument,
+  invalidateCollabDocumentAndWait,
   isCanonicalReadMutationReady,
+  preserveMarksOnlyWriteIfAuthoritativeYjsMatches,
+  reportCanonicalSyncRecoveryFailure,
+  syncCanonicalDocumentStateToCollab,
+  stripEphemeralCollabSpans,
   type CanonicalReadableDocument,
 } from './collab.js';
-import { mutateCanonicalDocument } from './canonical-document.js';
+import { mutateCanonicalDocument, recoverCanonicalDocumentIfNeeded } from './canonical-document.js';
 import { canonicalizeStoredMarks } from '../src/formats/marks.js';
+import {
+  canonicalizeAnchorTargetText,
+  stripMarkdownVisibleText,
+} from '../src/shared/anchor-target-text.js';
+import {
+  applyPostMutationCleanup,
+  buildAnchorRetrySteps,
+  type AnchorResolveSuccess,
+  stabilizeAnchorTarget,
+  type AnchorTarget,
+  isAgentEditAnchorV2Enabled,
+  isAuthoredSpanRemapEnabled,
+  isFailClosedDuplicateHandlingEnabled,
+  isStructuralCleanupEnabled,
+  resolveAnchorTarget,
+} from './anchor-resolver.js';
 import {
   finalizeSuggestionThroughRehydration,
   type ProofMarkRehydrationFailure,
 } from './proof-mark-rehydration.js';
+import { stripAllProofSpanTags } from './proof-span-strip.js';
+import {
+  recordEditAnchorAmbiguous,
+  recordEditAnchorNotFound,
+  recordEditAuthoredSpanRemap,
+  recordEditStructuralCleanupApplied,
+} from './metrics.js';
 
 type JsonRecord = Record<string, unknown>;
 
@@ -41,6 +72,7 @@ type StoredMark = {
   resolved?: boolean;
   content?: string;
   status?: 'pending' | 'accepted' | 'rejected';
+  target?: AnchorTarget;
   startRel?: string;
   endRel?: string;
   [key: string]: unknown;
@@ -51,28 +83,142 @@ export interface EngineExecutionResult {
   body: JsonRecord;
 }
 
+type AsyncDocumentMutationPrecondition = {
+  mode: 'none' | 'token' | 'revision' | 'updatedAt';
+  baseToken?: string;
+  baseRevision?: number;
+  baseUpdatedAt?: string;
+};
+
 export type AsyncDocumentMutationContext = {
   doc: CanonicalReadableDocument;
+  mutationBase?: AuthoritativeMutationBase | null;
+  enforceProjectionReadiness?: boolean;
+  precondition?: AsyncDocumentMutationPrecondition;
+  idempotencyKey?: string;
+  idempotencyRoute?: string;
 };
+
+function mutationContextIdempotencyKey(context?: AsyncDocumentMutationContext): string | undefined {
+  return typeof context?.idempotencyKey === 'string' && context.idempotencyKey.trim()
+    ? context.idempotencyKey.trim()
+    : undefined;
+}
+
+function mutationContextIdempotencyRoute(context?: AsyncDocumentMutationContext): string | undefined {
+  return typeof context?.idempotencyRoute === 'string' && context.idempotencyRoute.trim()
+    ? context.idempotencyRoute.trim()
+    : undefined;
+}
 
 function getCanonicalReadableDocument(slug: string) {
   return getCanonicalReadableDocumentSync(slug, 'state') ?? getDocumentBySlug(slug);
+}
+
+type MutationReadyDocument = NonNullable<ReturnType<typeof getCanonicalReadableDocument>>;
+
+function isMutationReadyRead(doc: MutationReadyDocument): boolean {
+  return 'mutation_ready' in doc
+    ? isCanonicalReadMutationReady(doc as { mutation_ready?: boolean })
+    : true;
+}
+
+function isProjectionRepairPending(doc: MutationReadyDocument): boolean {
+  const projectionDoc = doc as CanonicalReadableDocument;
+  return 'projection_fresh' in doc
+    ? projectionDoc.projection_fresh === false || projectionDoc.repair_pending === true
+    : false;
+}
+
+async function getCanonicalReadableDocumentAsync(
+  slug: string,
+  docOverride?: MutationReadyDocument,
+): Promise<MutationReadyDocument | null> {
+  const doc = docOverride
+    ?? await getAuthoritativeCanonicalReadableDocument(slug, 'state')
+    ?? getDocumentBySlug(slug);
+  if (!doc) return null;
+  if (!isMutationReadyRead(doc)) return doc;
+  const authoritativeDoc = await getAuthoritativeCanonicalReadableDocument(slug, 'state');
+  return authoritativeDoc ?? doc;
 }
 
 function getMutationReadyDocument(
   slug: string,
   context?: AsyncDocumentMutationContext,
 ):
-  | { doc: NonNullable<ReturnType<typeof getCanonicalReadableDocument>>; error: null }
+  | { doc: MutationReadyDocument; error: null }
   | { doc: null; error: EngineExecutionResult } {
+  if (context?.mutationBase && !context.enforceProjectionReadiness) {
+    return { doc: context.doc, error: null };
+  }
   const doc = context?.doc ?? getCanonicalReadableDocument(slug);
   if (!doc) {
     return { doc: null, error: { status: 404, body: { success: false, error: 'Document not found' } } };
   }
-  if (!isCanonicalReadMutationReady(doc)) {
+  if (!isMutationReadyRead(doc)) {
+    const fallbackDoc = getDocumentBySlug(slug);
+    const persistedVisible = normalizeVisibleMutationMarkdown(fallbackDoc?.markdown ?? '');
+    const authoritativeVisible = normalizeVisibleMutationMarkdown(doc.markdown ?? '');
+    if (fallbackDoc && persistedVisible === authoritativeVisible) {
+      return {
+        doc: {
+          ...(fallbackDoc as MutationReadyDocument),
+          marks: doc.marks,
+          plain_text: fallbackDoc.markdown,
+        } as MutationReadyDocument,
+        error: null,
+      };
+    }
     return { doc: null, error: projectionStaleMutationResult() };
   }
   return { doc, error: null };
+}
+
+async function getMutationReadyDocumentAsync(
+  slug: string,
+  context?: AsyncDocumentMutationContext,
+):
+  Promise<
+    | { doc: MutationReadyDocument; error: null }
+    | { doc: null; error: EngineExecutionResult }
+  > {
+  if (context?.mutationBase && !context.enforceProjectionReadiness) {
+    return { doc: context.doc, error: null };
+  }
+  let doc = context?.doc
+    ? await getCanonicalReadableDocumentAsync(slug, context.doc)
+    : await getCanonicalReadableDocumentAsync(slug);
+  if (!doc) {
+    return { doc: null, error: { status: 404, body: { success: false, error: 'Document not found' } } };
+  }
+  const repairPending = isProjectionRepairPending(doc);
+  if (repairPending || !isMutationReadyRead(doc)) {
+    const recovered = await recoverCanonicalDocumentIfNeeded(slug, 'mutation');
+    if (recovered) {
+      doc = await getCanonicalReadableDocumentAsync(slug, recovered as MutationReadyDocument)
+        ?? recovered as MutationReadyDocument;
+    }
+  }
+  if (!isMutationReadyRead(doc)) {
+    return { doc: null, error: projectionStaleMutationResult() };
+  }
+  return { doc: doc as MutationReadyDocument, error: null };
+}
+
+function resolveReadyDocument(
+  slug: string,
+  context?: MutationReadyDocument | AsyncDocumentMutationContext,
+):
+  | { doc: MutationReadyDocument; error: null }
+  | { doc: null; error: EngineExecutionResult } {
+  if (context && 'doc' in context) {
+    return getMutationReadyDocument(slug, context);
+  }
+  if (context) {
+    return { doc: context, error: null };
+  }
+  return getMutationReadyDocument(slug);
 }
 
 function projectionStaleMutationResult(): EngineExecutionResult {
@@ -84,6 +230,90 @@ function projectionStaleMutationResult(): EngineExecutionResult {
       error: 'Document projection is stale; retry after repair completes',
     },
   };
+}
+
+function normalizeVisibleMutationMarkdown(markdown: string): string {
+  return normalizeMarkdownForQuote(stripEphemeralCollabSpans(stripAllProofSpanTags(markdown)));
+}
+
+async function getAsyncMutationReadyDocumentWithVisibleFallback(
+  slug: string,
+  context?: AsyncDocumentMutationContext,
+): Promise<
+  | { doc: MutationReadyDocument; error: null }
+  | { doc: null; error: EngineExecutionResult }
+> {
+  const ready = await getMutationReadyDocumentAsync(slug, context);
+  if (ready.error) {
+    const fallbackDoc = (
+      ready.error.status === 409
+      && isRecord(ready.error.body)
+      && ready.error.body.code === 'PROJECTION_STALE'
+    )
+      ? getDocumentBySlug(slug)
+      : null;
+    const authoritativeFallback = fallbackDoc
+      ? await getCanonicalReadableDocumentAsync(slug)
+      : null;
+    const authoritativeFallbackMarkdown = typeof context?.mutationBase?.markdown === 'string'
+      ? context.mutationBase.markdown
+      : (authoritativeFallback?.markdown ?? '');
+    const authoritativeFallbackMarks = context?.mutationBase
+      ? JSON.stringify(context.mutationBase.marks ?? {})
+      : (authoritativeFallback?.marks ?? '{}');
+    const persistedVisible = fallbackDoc
+      ? normalizeVisibleMutationMarkdown(fallbackDoc.markdown ?? '')
+      : '';
+    const authoritativeVisible = normalizeVisibleMutationMarkdown(authoritativeFallbackMarkdown);
+    if (!fallbackDoc || persistedVisible !== authoritativeVisible) return ready;
+    return {
+      doc: {
+        ...(fallbackDoc as MutationReadyDocument),
+        marks: authoritativeFallbackMarks,
+        plain_text: fallbackDoc.markdown,
+      } as MutationReadyDocument,
+      error: null,
+    };
+  }
+
+  let doc = ready.doc;
+  if (context?.mutationBase) {
+    const persistedDoc = getDocumentBySlug(slug);
+    const persistedMarkdown = persistedDoc?.markdown ?? '';
+    const authoritativeMarkdown = doc.markdown ?? '';
+    const persistedVisible = normalizeVisibleMutationMarkdown(persistedMarkdown);
+    const authoritativeVisible = normalizeVisibleMutationMarkdown(authoritativeMarkdown);
+    if (
+      persistedDoc
+      && persistedMarkdown.includes('data-proof=')
+      && persistedVisible === authoritativeVisible
+    ) {
+      doc = {
+        ...doc,
+        markdown: persistedDoc.markdown,
+        plain_text: persistedDoc.markdown,
+      };
+    }
+  }
+
+  return { doc, error: null };
+}
+
+function buildCanonicalMutationBaseArgs(
+  doc: Pick<MutationReadyDocument, 'revision' | 'updated_at'>,
+  context?: AsyncDocumentMutationContext,
+): { baseToken?: string; baseRevision?: number; baseUpdatedAt?: string } {
+  const precondition = context?.precondition;
+  if (precondition?.mode === 'token' && typeof precondition.baseToken === 'string' && precondition.baseToken.trim()) {
+    return { baseToken: precondition.baseToken.trim() };
+  }
+  if (precondition?.mode === 'revision' && typeof precondition.baseRevision === 'number') {
+    return { baseRevision: precondition.baseRevision };
+  }
+  if (precondition?.mode === 'updatedAt' && typeof precondition.baseUpdatedAt === 'string' && precondition.baseUpdatedAt.trim()) {
+    return { baseUpdatedAt: precondition.baseUpdatedAt.trim() };
+  }
+  return typeof doc.revision === 'number' ? { baseRevision: doc.revision } : {};
 }
 
 function isRecord(value: unknown): value is JsonRecord {
@@ -104,45 +334,13 @@ function normalizeQuote(value: unknown): string {
   return value.replace(/\s+/g, ' ').trim();
 }
 
-function stripMarkdownFormatting(markdown: string): string {
-  let text = markdown ?? '';
-
-  // Replace block-level tags with spaces, then remove remaining tags.
-  text = text.replace(/<\/?(?:p|br|div|li)\b[^>]*>/gi, ' ');
-  text = text.replace(/<[^>]+>/g, '');
-
-  // Convert images/links to their visible text.
-  text = text.replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1');
-  text = text.replace(/\[([^\]]+)\]\([^)]*\)/g, '$1');
-  text = text.replace(/\[([^\]]+)\]\[[^\]]*\]/g, '$1');
-
-  // Strip fenced code blocks but keep inner text.
-  text = text.replace(/```([\s\S]*?)```/g, '$1');
-  text = text.replace(/~~~([\s\S]*?)~~~/g, '$1');
-
-  // Strip inline code markers.
-  text = text.replace(/`([^`]+)`/g, '$1');
-
-  // Strip common emphasis/strike markers.
-  text = text.replace(/\*\*\*([^*]+)\*\*\*/g, '$1');
-  text = text.replace(/(?<!\w)___([^_]+)___(?!\w)/g, '$1');
-  text = text.replace(/\*\*([^*]+)\*\*/g, '$1');
-  text = text.replace(/(?<!\w)__([^_]+)__(?!\w)/g, '$1');
-  text = text.replace(/\*([^*]+)\*/g, '$1');
-  text = text.replace(/(?<!\w)_([^_]+)_(?!\w)/g, '$1');
-  text = text.replace(/~~([^~]+)~~/g, '$1');
-
-  // Remove markdown line prefixes (headings, lists, blockquotes).
-  text = text.replace(/^[ \t]*#{1,6}[ \t]+/gm, '');
-  text = text.replace(/^[ \t]*>[ \t]?/gm, '');
-  text = text.replace(/^[ \t]*(?:[-*+]|\d+\.)[ \t]+/gm, '');
-  text = text.replace(/^[ \t]*\[(?: |x|X)\][ \t]+/gm, '');
-  text = text.replace(/^[ \t]*([-*_]){3,}[ \t]*$/gm, '');
-
-  // Unescape markdown escapes.
-  text = text.replace(/\\([\\`*_{}\[\]()#+\-.!])/g, '$1');
-
-  return text;
+function parseRelativeCharOffset(value: unknown): number | null {
+  if (typeof value !== 'string') return null;
+  const match = value.match(/^char:(\d+)$/);
+  if (!match) return null;
+  const parsed = Number.parseInt(match[1], 10);
+  if (!Number.isFinite(parsed) || parsed < 0) return null;
+  return parsed;
 }
 
 function stripMarkdownWithMapping(markdown: string): { stripped: string; map: number[] } {
@@ -253,12 +451,12 @@ function stripMarkdownWithMapping(markdown: string): { stripped: string; map: nu
 
     // HTML tag handling (only check when we see '<' to keep the loop O(n))
     if (source[i] === '<') {
-      // Block-level HTML tags become a space.
+      // Block-level HTML tags become a block separator in the visible-text domain.
       const blockTagMatch = source.slice(i).match(/^<\/?(?:p|br|div|li)\b[^>]*>/i);
       if (blockTagMatch) {
         const matchLen = blockTagMatch[0].length;
         const closingIdx = i + matchLen - 1;
-        pushChar(' ', closingIdx);
+        pushChar('\n', closingIdx);
         i += matchLen;
         continue;
       }
@@ -426,7 +624,65 @@ function stripMarkdownWithMapping(markdown: string): { stripped: string; map: nu
 }
 
 function normalizeMarkdownForQuote(markdown: string): string {
-  return normalizeQuote(stripMarkdownFormatting(markdown));
+  return normalizeQuote(stripMarkdownVisibleText(markdown));
+}
+
+function canonicalizeVisibleTextWithMapping(
+  stripped: string,
+  map: number[],
+): { text: string; map: number[] } {
+  const textChars: string[] = [];
+  const canonicalMap: number[] = [];
+  let index = 0;
+
+  while (index < stripped.length) {
+    const ch = stripped[index];
+    if (ch === '\r') {
+      index += 1;
+      continue;
+    }
+
+    if (ch === '\n') {
+      let end = index + 1;
+      while (end < stripped.length) {
+        const next = stripped[end];
+        if (next === '\r') {
+          end += 1;
+          continue;
+        }
+        if (next === '\n' || next === ' ' || next === '\t') {
+          end += 1;
+          continue;
+        }
+        break;
+      }
+
+      while (textChars.length > 0 && (textChars[textChars.length - 1] === ' ' || textChars[textChars.length - 1] === '\t')) {
+        textChars.pop();
+        canonicalMap.pop();
+      }
+      if (textChars.length > 0 && end < stripped.length && textChars[textChars.length - 1] !== '\n') {
+        textChars.push('\n');
+        canonicalMap.push(map[Math.min(end - 1, map.length - 1)] ?? map[index] ?? 0);
+      }
+      index = end;
+      continue;
+    }
+
+    if ((ch === ' ' || ch === '\t') && textChars[textChars.length - 1] === '\n') {
+      index += 1;
+      continue;
+    }
+
+    textChars.push(ch);
+    canonicalMap.push(map[index] ?? 0);
+    index += 1;
+  }
+
+  return {
+    text: textChars.join(''),
+    map: canonicalMap,
+  };
 }
 
 function expandMarkdownSpan(markdown: string, start: number, end: number): { start: number; end: number } {
@@ -624,6 +880,25 @@ function findQuoteSpanInMarkdown(markdown: string, quote: string): { start: numb
   return expandMarkdownSpan(markdown, anchor.rawStart, anchor.rawEnd);
 }
 
+function canRejectSuggestionWithoutHydration(markdown: string, mark: StoredMark): boolean {
+  if (mark.kind !== 'insert' && mark.kind !== 'delete' && mark.kind !== 'replace') return false;
+  const quote = normalizeQuote(mark.quote);
+  if (!quote) return false;
+  const anchor = findQuoteAnchorInMarkdown(markdown, quote);
+  if (!anchor) return false;
+
+  const startRel = parseRelativeCharOffset(mark.startRel);
+  const endRel = parseRelativeCharOffset(mark.endRel);
+  if (startRel === null && endRel === null) return false;
+  if (startRel !== null && Math.abs(anchor.strippedStart - startRel) > 1) return false;
+  if (endRel !== null && Math.abs(anchor.strippedEnd - endRel) > 1) return false;
+  return true;
+}
+
+export function __canRejectSuggestionWithoutHydrationForTests(markdown: string, mark: StoredMark): boolean {
+  return canRejectSuggestionWithoutHydration(markdown, mark);
+}
+
 function replaceFirstOccurrence(source: string, find: string, replace: string): string | null {
   const idx = source.indexOf(find);
   if (idx < 0) return null;
@@ -731,6 +1006,224 @@ function toStructuredMutationFailureResult(
   }
 }
 
+function parseAnchorTarget(raw: unknown): { ok: true; target: AnchorTarget } | { ok: false; error: string } {
+  if (!isRecord(raw)) return { ok: false, error: 'target must be an object' };
+  if (typeof raw.anchor !== 'string' || !raw.anchor.length) {
+    return { ok: false, error: 'target.anchor must be a non-empty string' };
+  }
+
+  const target: AnchorTarget = { anchor: raw.anchor };
+  if (raw.mode !== undefined) {
+    if (raw.mode !== 'exact' && raw.mode !== 'normalized' && raw.mode !== 'contextual') {
+      return { ok: false, error: 'target.mode must be exact, normalized, or contextual' };
+    }
+    target.mode = raw.mode;
+  }
+  if (raw.occurrence !== undefined) {
+    if (raw.occurrence === 'first' || raw.occurrence === 'last') {
+      target.occurrence = raw.occurrence;
+    } else if (Number.isInteger(raw.occurrence) && (raw.occurrence as number) >= 0) {
+      target.occurrence = raw.occurrence as number;
+    } else {
+      return { ok: false, error: 'target.occurrence must be first, last, or a 0-based integer' };
+    }
+  }
+  if (raw.contextBefore !== undefined) {
+    if (typeof raw.contextBefore !== 'string') return { ok: false, error: 'target.contextBefore must be a string' };
+    target.contextBefore = raw.contextBefore;
+  }
+  if (raw.contextAfter !== undefined) {
+    if (typeof raw.contextAfter !== 'string') return { ok: false, error: 'target.contextAfter must be a string' };
+    target.contextAfter = raw.contextAfter;
+  }
+  return { ok: true, target };
+}
+
+function buildImplicitLegacyTarget(anchor: string): AnchorTarget {
+  return {
+    anchor,
+    mode: isAgentEditAnchorV2Enabled() ? 'normalized' : 'exact',
+    occurrence: 'first',
+  };
+}
+
+function mapVisibleSelectionToSourceRange(
+  markdown: string,
+  map: number[],
+  startOffset: number,
+  endOffset: number,
+): { sourceStart: number; sourceEnd: number } | null {
+  if (!Number.isInteger(startOffset) || !Number.isInteger(endOffset) || endOffset <= startOffset) return null;
+  if (startOffset < 0 || endOffset > map.length) return null;
+  const sourceStart = map[startOffset];
+  const sourceEndInclusive = map[endOffset - 1];
+  if (!Number.isInteger(sourceStart) || !Number.isInteger(sourceEndInclusive)) return null;
+  return {
+    sourceStart: Math.max(0, Math.min(markdown.length, sourceStart)),
+    sourceEnd: Math.max(0, Math.min(markdown.length, sourceEndInclusive + 1)),
+  };
+}
+
+function buildAcceptedSuggestionMarkdownFromSelection(
+  markdown: string,
+  suggestion: StoredMark,
+  selection: { sourceStart: number; sourceEnd: number },
+): string {
+  const rawStart = Math.min(selection.sourceStart, selection.sourceEnd);
+  const rawEnd = Math.max(selection.sourceStart, selection.sourceEnd);
+  const span = expandMarkdownSpan(markdown, rawStart, rawEnd);
+
+  if (suggestion.kind === 'insert') {
+    const content = typeof suggestion.content === 'string' ? suggestion.content : '';
+    return `${markdown.slice(0, span.end)}${content}${markdown.slice(span.end)}`;
+  }
+
+  if (suggestion.kind === 'delete') {
+    return `${markdown.slice(0, span.start)}${markdown.slice(span.end)}`;
+  }
+
+  if (suggestion.kind === 'replace') {
+    const content = typeof suggestion.content === 'string' ? suggestion.content : '';
+    const prefix = markdown.slice(span.start, rawStart);
+    const suffix = markdown.slice(rawEnd, span.end);
+    return `${markdown.slice(0, span.start)}${prefix}${content}${suffix}${markdown.slice(span.end)}`;
+  }
+
+  return markdown;
+}
+
+function resolveMutationAnchor(
+  route: string,
+  markdown: string,
+  target: AnchorTarget,
+  notFoundError: string,
+): {
+    ok: true;
+    resolved: AnchorResolveSuccess;
+    normalizedTarget: AnchorTarget;
+    logicalSource: string;
+  } | { ok: false; result: EngineExecutionResult } {
+  const anchorV2Enabled = isAgentEditAnchorV2Enabled();
+  const normalizedTarget = canonicalizeAnchorTargetText(target);
+  const { stripped, map } = stripMarkdownWithMapping(markdown);
+  const canonical = canonicalizeVisibleTextWithMapping(stripped, map);
+  const resolved = resolveAnchorTarget(canonical.text, normalizedTarget, {
+    defaultMode: normalizedTarget.mode,
+    failClosedDuplicates: anchorV2Enabled ? isFailClosedDuplicateHandlingEnabled() : false,
+    stripAuthoredSpans: false,
+  });
+
+  if (!resolved.ok) {
+    if (resolved.code === 'ANCHOR_AMBIGUOUS') recordEditAnchorAmbiguous(route, resolved.mode);
+    else recordEditAnchorNotFound(route, resolved.mode);
+    return {
+      ok: false,
+      result: {
+        status: 409,
+        body: {
+          success: false,
+          code: resolved.code,
+          error: resolved.code === 'ANCHOR_AMBIGUOUS' ? 'Anchor target is ambiguous in current markdown' : notFoundError,
+          details: {
+            candidateCount: resolved.candidateCount,
+            mode: resolved.mode,
+            remapUsed: resolved.remapUsed,
+          },
+          nextSteps: buildAnchorRetrySteps(resolved.code),
+        },
+      },
+    };
+  }
+
+  const mappedSelection = mapVisibleSelectionToSourceRange(
+    markdown,
+    canonical.map,
+    resolved.selection.sourceStart,
+    resolved.selection.sourceEnd,
+  );
+  if (!mappedSelection) {
+    recordEditAnchorNotFound(route, resolved.mode);
+    return {
+      ok: false,
+      result: {
+        status: 409,
+        body: {
+          success: false,
+          code: 'ANCHOR_NOT_FOUND',
+          error: notFoundError,
+          details: {
+            candidateCount: 0,
+            mode: resolved.mode,
+            remapUsed: resolved.remapUsed,
+          },
+          nextSteps: buildAnchorRetrySteps('ANCHOR_NOT_FOUND'),
+        },
+      },
+    };
+  }
+
+  if (resolved.remapUsed && isAuthoredSpanRemapEnabled()) {
+    recordEditAuthoredSpanRemap(route, resolved.mode);
+  }
+
+  return {
+    ok: true,
+    normalizedTarget,
+    logicalSource: canonical.text,
+    resolved: {
+      ...resolved,
+      selection: {
+        ...resolved.selection,
+        sourceStart: mappedSelection.sourceStart,
+        sourceEnd: mappedSelection.sourceEnd,
+      },
+    },
+  };
+}
+
+function buildStoredSelectionMetadata(
+  markdown: string,
+  selection: { sourceStart: number; sourceEnd: number },
+  fallbackQuote: string,
+): { quote: string; startRel?: string; endRel?: string } {
+  const normalizedFallback = normalizeQuote(fallbackQuote);
+  const { stripped, map } = stripMarkdownWithMapping(markdown);
+  const canonical = canonicalizeVisibleTextWithMapping(stripped, map);
+  const sourceStart = Math.min(selection.sourceStart, selection.sourceEnd);
+  const sourceEnd = Math.max(selection.sourceStart, selection.sourceEnd);
+  let startOffset = -1;
+  let endOffset = -1;
+
+  for (let i = 0; i < canonical.map.length; i += 1) {
+    const sourceIndex = canonical.map[i];
+    if (sourceIndex < sourceStart || sourceIndex >= sourceEnd) continue;
+    if (startOffset < 0) startOffset = i;
+    endOffset = i + 1;
+  }
+
+  if (startOffset >= 0 && endOffset > startOffset) {
+    const quote = normalizeQuote(canonical.text.slice(startOffset, endOffset)) || normalizedFallback;
+    return {
+      quote,
+      startRel: `char:${startOffset}`,
+      endRel: `char:${endOffset}`,
+    };
+  }
+
+  return { quote: normalizedFallback };
+}
+
+function applyMutationCleanup(route: string, markdown: string, structuralCleanupOffsets: number[] = []): string {
+  const cleanup = applyPostMutationCleanup(markdown, {
+    structuralCleanupEnabled: isStructuralCleanupEnabled(),
+    structuralCleanupOffsets,
+  });
+  if (cleanup.structuralCleanupApplied) {
+    recordEditStructuralCleanupApplied(route);
+  }
+  return cleanup.markdown;
+}
+
 function readState(slug: string): EngineExecutionResult {
   const doc = getCanonicalReadableDocument(slug);
   if (!doc || doc.share_state === 'DELETED') {
@@ -739,9 +1232,10 @@ function readState(slug: string): EngineExecutionResult {
   if (doc.share_state === 'REVOKED') {
     return { status: 403, body: { error: 'Document access revoked', success: false } };
   }
-  const mutationReady = isCanonicalReadMutationReady(doc);
+  const mutationReady = isMutationReadyRead(doc);
   const readSource = 'read_source' in doc ? doc.read_source : 'projection';
   const projectionFresh = 'projection_fresh' in doc ? doc.projection_fresh : true;
+  const repairPending = 'repair_pending' in doc ? doc.repair_pending : !projectionFresh;
   const marks = parseMarks(doc.marks);
   return {
     status: 200,
@@ -758,17 +1252,70 @@ function readState(slug: string): EngineExecutionResult {
       revision: mutationReady ? doc.revision : null,
       readSource,
       projectionFresh,
+      repairPending,
       mutationReady,
-      ...(!mutationReady
+      ...(repairPending
         ? {
           warning: {
             code: 'PROJECTION_STALE',
             error: 'Canonical reads are serving Yjs fallback content while projection repair catches up.',
+            fallbackReason: 'read_fallback_reason' in doc ? doc.read_fallback_reason ?? null : null,
+            yjsSource: 'yjs_source' in doc ? doc.yjs_source ?? null : null,
           },
         }
         : {}),
     },
   };
+}
+
+async function readStateAsync(slug: string): Promise<EngineExecutionResult> {
+  const doc = await getCanonicalReadableDocumentAsync(slug);
+  if (!doc || doc.share_state === 'DELETED') {
+    return { status: 404, body: { error: 'Document not found', success: false } };
+  }
+  if (doc.share_state === 'REVOKED') {
+    return { status: 403, body: { error: 'Document access revoked', success: false } };
+  }
+  const mutationReady = isMutationReadyRead(doc);
+  const readSource = 'read_source' in doc ? doc.read_source : 'projection';
+  const projectionFresh = 'projection_fresh' in doc ? doc.projection_fresh : true;
+  const repairPending = 'repair_pending' in doc ? doc.repair_pending : !projectionFresh;
+  const marks = parseMarks(doc.marks);
+  return {
+    status: 200,
+    body: {
+      success: true,
+      slug: doc.slug,
+      docId: doc.doc_id,
+      title: doc.title,
+      shareState: doc.share_state,
+      content: doc.markdown,
+      markdown: doc.markdown,
+      marks,
+      updatedAt: mutationReady ? doc.updated_at : null,
+      revision: mutationReady ? doc.revision : null,
+      readSource,
+      projectionFresh,
+      repairPending,
+      mutationReady,
+      ...(repairPending
+        ? {
+          warning: {
+            code: 'PROJECTION_STALE',
+            error: 'Canonical reads are serving Yjs fallback content while projection repair catches up.',
+            fallbackReason: 'read_fallback_reason' in doc ? doc.read_fallback_reason ?? null : null,
+            yjsSource: 'yjs_source' in doc ? doc.yjs_source ?? null : null,
+          },
+        }
+        : {}),
+    },
+  };
+}
+
+async function readMarksAsync(slug: string): Promise<EngineExecutionResult> {
+  const doc = await getCanonicalReadableDocumentAsync(slug);
+  if (!doc) return { status: 404, body: { success: false, error: 'Document not found' } };
+  return { status: 200, body: { success: true, marks: parseMarks(doc.marks) } };
 }
 
 function persistMarks(slug: string, marks: Record<string, StoredMark>, actor: string, eventType: string, eventData: JsonRecord): EngineExecutionResult {
@@ -782,15 +1329,21 @@ function persistMarks(slug: string, marks: Record<string, StoredMark>, actor: st
     });
   }
 
+  if (hasPotentiallyLiveCollabDoc(slug)) {
+    return {
+      status: 503,
+      body: {
+        success: false,
+        code: 'COLLAB_SYNC_REQUIRED',
+        error: 'Live collaborative state requires the async collab-aware mark mutation path',
+      },
+    };
+  }
+
   const ok = updateMarks(slug, normalizedMarks as unknown as Record<string, unknown>);
   if (!ok) {
     return { status: 500, body: { success: false, error: 'Failed to update marks' } };
   }
-  // Sync marks to Yjs collab layer so they aren't overwritten on next materialization
-  applyCanonicalDocumentToCollab(slug, { marks: normalizedMarks as unknown as Record<string, unknown>, source: 'engine' }).catch((error) => {
-    console.error('[document-engine] Failed to sync marks to collab projection; invalidating collab state', { slug, error });
-    invalidateCollabDocument(slug);
-  });
   const eventId = addDocumentEvent(slug, eventType, eventData, actor);
   refreshSnapshotForSlug(slug);
   const doc = getDocumentBySlug(slug);
@@ -810,10 +1363,221 @@ function persistMarks(slug: string, marks: Record<string, StoredMark>, actor: st
   };
 }
 
-function addComment(slug: string, body: JsonRecord): EngineExecutionResult {
-  const ready = getMutationReadyDocument(slug);
+async function persistMarksWithAuthoritativeSync(
+  slug: string,
+  previousMarks: Record<string, StoredMark>,
+  nextMarks: Record<string, StoredMark>,
+  actor: string,
+  eventType: string,
+  eventData: JsonRecord,
+): Promise<EngineExecutionResult> {
+  const ok = updateMarks(slug, nextMarks as unknown as Record<string, unknown>);
+  if (!ok) {
+    return { status: 500, body: { success: false, error: 'Failed to update marks' } };
+  }
+
+  let syncFailureReason: string | null = null;
+  try {
+    const syncResult = await syncCanonicalDocumentStateToCollab(slug, {
+      marks: nextMarks as unknown as Record<string, unknown>,
+      source: 'engine',
+    });
+    if (!syncResult.applied) {
+      syncFailureReason = syncResult.reason;
+    }
+  } catch (error) {
+    console.error('[document-engine] Failed to sync marks into canonical collab state:', { slug, error });
+    syncFailureReason = 'apply_failed';
+  }
+
+  if (syncFailureReason) {
+    if (
+      syncFailureReason === 'fragment_unhealthy_marks_only'
+      && await preserveMarksOnlyWriteIfAuthoritativeYjsMatches(slug, nextMarks as unknown as Record<string, unknown>)
+    ) {
+      const eventId = addDocumentEvent(slug, eventType, eventData, actor);
+      refreshSnapshotForSlug(slug);
+      const doc = getDocumentBySlug(slug);
+      const markId = typeof eventData.markId === 'string' && eventData.markId.trim().length > 0
+        ? eventData.markId.trim()
+        : undefined;
+      return {
+        status: 200,
+        body: {
+          success: true,
+          eventId,
+          ...(markId ? { markId } : {}),
+          shareState: doc?.share_state ?? 'ACTIVE',
+          updatedAt: doc?.updated_at ?? new Date().toISOString(),
+          marks: nextMarks,
+        },
+      };
+    }
+    const rolledBack = updateMarks(slug, previousMarks as unknown as Record<string, unknown>);
+    if (!rolledBack) {
+      console.error('[document-engine] Failed to roll back marks after collab sync refusal', {
+        slug,
+        reason: syncFailureReason,
+      });
+      reportCanonicalSyncRecoveryFailure(slug, {
+        surface: 'document_engine',
+        route: eventType,
+        stage: 'rollback_failed',
+        reason: syncFailureReason,
+        rolledBack: false,
+      });
+    }
+    try {
+      await invalidateCollabDocumentAndWait(slug);
+    } catch (error) {
+      console.error('[document-engine] Failed to fully invalidate collab state after marks sync refusal', {
+        slug,
+        reason: syncFailureReason,
+        error,
+      });
+      reportCanonicalSyncRecoveryFailure(slug, {
+        surface: 'document_engine',
+        route: eventType,
+        stage: 'invalidate_failed',
+        reason: syncFailureReason,
+        rolledBack,
+        error,
+      });
+    }
+    return {
+      status: 503,
+      body: {
+        success: false,
+        code: 'COLLAB_SYNC_FAILED',
+        error: 'Failed to synchronize marks with collab state; retry with latest state',
+      },
+    };
+  }
+
+  const eventId = addDocumentEvent(slug, eventType, eventData, actor);
+  refreshSnapshotForSlug(slug);
+  const doc = getDocumentBySlug(slug);
+  const markId = typeof eventData.markId === 'string' && eventData.markId.trim().length > 0
+    ? eventData.markId.trim()
+    : undefined;
+  return {
+    status: 200,
+    body: {
+      success: true,
+      eventId,
+      ...(markId ? { markId } : {}),
+      shareState: doc?.share_state ?? 'ACTIVE',
+      updatedAt: doc?.updated_at ?? new Date().toISOString(),
+      marks: nextMarks,
+    },
+  };
+}
+
+async function persistMarksAsync(
+  slug: string,
+  doc: MutationReadyDocument,
+  marks: Record<string, StoredMark>,
+  actor: string,
+  eventType: string,
+  eventData: JsonRecord,
+  context?: AsyncDocumentMutationContext,
+): Promise<EngineExecutionResult> {
+  const scrubbed = removeResurrectedMarksFromPayload(slug, marks as unknown as Record<string, unknown>);
+  const normalizedMarks = canonicalizeStoredMarks(scrubbed.marks as Record<string, StoredMark>);
+  if (scrubbed.removed.length > 0) {
+    console.warn('[document-engine] removed tombstoned marks from persistence payload', {
+      slug,
+      removed: scrubbed.removed.length,
+      eventType,
+    });
+  }
+
+  const liveFragmentMarkdown = await getLoadedCollabMarkdownFromFragment(slug);
+  const currentRow = getDocumentBySlug(slug);
+  const persistedMarkdown = stripEphemeralCollabSpans(currentRow?.markdown ?? '');
+  const authoritativeMarkdown = stripEphemeralCollabSpans(doc.markdown ?? '');
+  const targetMarkdown = typeof liveFragmentMarkdown === 'string'
+    ? liveFragmentMarkdown
+    : (context?.mutationBase?.markdown ?? null);
+  const hasPersistedYjsState = typeof currentRow?.y_state_version === 'number' && currentRow.y_state_version > 0;
+  const yjsBackedMutationBase = context?.mutationBase
+    && context.mutationBase.source !== 'projection'
+    && context.mutationBase.source !== 'canonical_row';
+  const shouldCommitCanonical = (Boolean(context?.precondition) && hasPersistedYjsState)
+    || Boolean(yjsBackedMutationBase)
+    || (typeof targetMarkdown === 'string'
+      && stripEphemeralCollabSpans(targetMarkdown) !== persistedMarkdown);
+
+  if (!shouldCommitCanonical) {
+    if (hasPotentiallyLiveCollabDoc(slug)) {
+      return persistMarksWithAuthoritativeSync(
+        slug,
+        parseMarks(doc.marks),
+        normalizedMarks,
+        actor,
+        eventType,
+        eventData,
+      );
+    }
+    return persistMarks(slug, normalizedMarks, actor, eventType, eventData);
+  }
+
+  const mutation = await mutateCanonicalDocument({
+    slug,
+    nextMarkdown: targetMarkdown ?? authoritativeMarkdown,
+    nextMarks: normalizedMarks as unknown as Record<string, unknown>,
+    source: `engine:${eventType}:${actor}`,
+    ...buildCanonicalMutationBaseArgs(doc, context),
+    strictLiveDoc: true,
+    guardPathologicalGrowth: true,
+  });
+  if (!mutation.ok) {
+    return {
+      status: mutation.status,
+      body: {
+        success: false,
+        code: mutation.code,
+        error: mutation.error,
+        ...(mutation.retryWithState ? { retryWithState: mutation.retryWithState } : {}),
+      },
+    };
+  }
+
+  const eventId = addDocumentEvent(
+    slug,
+    eventType,
+    eventData,
+    actor,
+    mutationContextIdempotencyKey(context),
+    mutationContextIdempotencyRoute(context),
+  );
+  refreshSnapshotForSlug(slug);
+  const updated = mutation.document;
+  const markId = typeof eventData.markId === 'string' && eventData.markId.trim().length > 0
+    ? eventData.markId.trim()
+    : undefined;
+  return {
+    status: 200,
+    body: {
+      success: true,
+      eventId,
+      ...(markId ? { markId } : {}),
+      shareState: updated.share_state,
+      updatedAt: updated.updated_at,
+      marks: parseMarks(updated.marks),
+    },
+  };
+}
+
+function addComment(
+  slug: string,
+  body: JsonRecord,
+  context?: MutationReadyDocument | AsyncDocumentMutationContext,
+): EngineExecutionResult {
+  const ready = resolveReadyDocument(slug, context);
   if (ready.error) return ready.error;
   const doc = ready.doc;
+  const route = 'POST /marks/comment';
   const by = typeof body.by === 'string' && body.by.trim() ? body.by.trim() : 'ai:unknown';
   const text = typeof body.text === 'string' ? body.text : '';
   if (!text.trim()) {
@@ -824,7 +1588,16 @@ function addComment(slug: string, body: JsonRecord): EngineExecutionResult {
   if (!quote && isRecord(body.selector) && typeof body.selector.quote === 'string') {
     quote = normalizeQuote(body.selector.quote);
   }
-  if (quote) {
+  let target: AnchorTarget | undefined;
+  if (isRecord(body.target)) {
+    const parsed = parseAnchorTarget(body.target);
+    if (!parsed.ok) return { status: 400, body: { success: false, error: parsed.error } };
+    target = parsed.target;
+  } else if (isRecord(body.selector) && isRecord(body.selector.target)) {
+    const parsed = parseAnchorTarget(body.selector.target);
+    if (!parsed.ok) return { status: 400, body: { success: false, error: parsed.error } };
+    target = parsed.target;
+  } else if (quote) {
     const normalizedMarkdown = normalizeQuote(doc.markdown);
     const normalizedPlain = normalizeMarkdownForQuote(doc.markdown);
     if (!normalizedMarkdown.includes(quote) && !normalizedPlain.includes(quote)) {
@@ -834,6 +1607,21 @@ function addComment(slug: string, body: JsonRecord): EngineExecutionResult {
       };
     }
   }
+
+  let resolvedTarget: AnchorTarget | undefined;
+  let selectionMetadata: { quote: string; startRel?: string; endRel?: string } | null = null;
+  if (target) {
+    const resolved = resolveMutationAnchor(route, doc.markdown, target, 'Comment anchor quote not found in document');
+    if (!resolved.ok) return resolved.result;
+    resolvedTarget = stabilizeAnchorTarget(resolved.logicalSource, resolved.normalizedTarget, resolved.resolved);
+    selectionMetadata = buildStoredSelectionMetadata(
+      doc.markdown,
+      resolved.resolved.selection,
+      quote || resolved.normalizedTarget.anchor,
+    );
+    quote = selectionMetadata.quote;
+  }
+
   const id = randomUUID();
   const now = new Date().toISOString();
   const marks = parseMarks(doc.marks);
@@ -846,16 +1634,93 @@ function addComment(slug: string, body: JsonRecord): EngineExecutionResult {
     threadId: id,
     thread: [],
     resolved: false,
+    ...(resolvedTarget ? { target: resolvedTarget } : {}),
+    ...(selectionMetadata?.startRel ? { startRel: selectionMetadata.startRel } : {}),
+    ...(selectionMetadata?.endRel ? { endRel: selectionMetadata.endRel } : {}),
   };
   return persistMarks(slug, marks, by, 'comment.added', { markId: id, by, quote, text });
+}
+
+async function addCommentAsync(
+  slug: string,
+  body: JsonRecord,
+  context?: AsyncDocumentMutationContext,
+): Promise<EngineExecutionResult> {
+  const ready = await getMutationReadyDocumentAsync(slug, context);
+  if (ready.error) return ready.error;
+  const doc = ready.doc;
+  const route = 'POST /marks/comment';
+  const by = typeof body.by === 'string' && body.by.trim() ? body.by.trim() : 'ai:unknown';
+  const text = typeof body.text === 'string' ? body.text : '';
+  if (!text.trim()) {
+    return { status: 400, body: { success: false, error: 'Missing text' } };
+  }
+
+  let quote = normalizeQuote(body.quote);
+  if (!quote && isRecord(body.selector) && typeof body.selector.quote === 'string') {
+    quote = normalizeQuote(body.selector.quote);
+  }
+  let target: AnchorTarget | undefined;
+  if (isRecord(body.target)) {
+    const parsed = parseAnchorTarget(body.target);
+    if (!parsed.ok) return { status: 400, body: { success: false, error: parsed.error } };
+    target = parsed.target;
+  } else if (isRecord(body.selector) && isRecord(body.selector.target)) {
+    const parsed = parseAnchorTarget(body.selector.target);
+    if (!parsed.ok) return { status: 400, body: { success: false, error: parsed.error } };
+    target = parsed.target;
+  } else if (quote) {
+    const normalizedMarkdown = normalizeQuote(doc.markdown);
+    const normalizedPlain = normalizeMarkdownForQuote(doc.markdown);
+    if (!normalizedMarkdown.includes(quote) && !normalizedPlain.includes(quote)) {
+      return {
+        status: 409,
+        body: { success: false, code: 'ANCHOR_NOT_FOUND', error: 'Comment anchor quote not found in document' },
+      };
+    }
+  }
+
+  let resolvedTarget: AnchorTarget | undefined;
+  let selectionMetadata: { quote: string; startRel?: string; endRel?: string } | null = null;
+  if (target) {
+    const resolved = resolveMutationAnchor(route, doc.markdown, target, 'Comment anchor quote not found in document');
+    if (!resolved.ok) return resolved.result;
+    resolvedTarget = stabilizeAnchorTarget(resolved.logicalSource, resolved.normalizedTarget, resolved.resolved);
+    selectionMetadata = buildStoredSelectionMetadata(
+      doc.markdown,
+      resolved.resolved.selection,
+      quote || resolved.normalizedTarget.anchor,
+    );
+    quote = selectionMetadata.quote;
+  }
+
+  const id = randomUUID();
+  const now = new Date().toISOString();
+  const marks = parseMarks(doc.marks);
+  marks[id] = {
+    kind: 'comment',
+    by,
+    createdAt: now,
+    quote,
+    text,
+    threadId: id,
+    thread: [],
+    resolved: false,
+    ...(resolvedTarget ? { target: resolvedTarget } : {}),
+    ...(selectionMetadata?.startRel ? { startRel: selectionMetadata.startRel } : {}),
+    ...(selectionMetadata?.endRel ? { endRel: selectionMetadata.endRel } : {}),
+  };
+  return persistMarksAsync(slug, doc, marks, by, 'comment.added', { markId: id, by, quote, text }, context);
 }
 
 function addSuggestion(
   slug: string,
   body: JsonRecord,
   kind: 'insert' | 'delete' | 'replace',
+  context?: MutationReadyDocument | AsyncDocumentMutationContext,
 ): EngineExecutionResult {
-  const ready = getMutationReadyDocument(slug);
+  const route = `POST /marks/suggest-${kind}`;
+  const ready = resolveReadyDocument(slug, context);
   if (ready.error) return ready.error;
   const doc = ready.doc;
   const by = typeof body.by === 'string' && body.by.trim() ? body.by.trim() : 'ai:unknown';
@@ -863,19 +1728,44 @@ function addSuggestion(
   if (!quote && isRecord(body.selector) && typeof body.selector.quote === 'string') {
     quote = normalizeQuote(body.selector.quote);
   }
-  if (!quote) {
-    return { status: 400, body: { success: false, error: 'Missing quote' } };
+  let target: AnchorTarget | undefined;
+  if (isRecord(body.target)) {
+    const parsed = parseAnchorTarget(body.target);
+    if (!parsed.ok) return { status: 400, body: { success: false, error: parsed.error } };
+    target = parsed.target;
+  } else if (quote) {
+    target = buildImplicitLegacyTarget(quote);
   }
-  const anchor = findQuoteAnchorInMarkdown(doc.markdown, quote);
-  if (!anchor) {
-    return {
-      status: 409,
-      body: { success: false, code: 'ANCHOR_NOT_FOUND', error: 'Suggestion anchor quote not found in document' },
-    };
+  if (!target) {
+    return { status: 400, body: { success: false, error: 'Missing quote' } };
   }
   if ((kind === 'insert' || kind === 'replace') && typeof body.content !== 'string') {
     return { status: 400, body: { success: false, error: 'Missing content' } };
   }
+
+  let resolvedTarget: AnchorTarget | undefined;
+  let selectionMetadata: { quote: string; startRel?: string; endRel?: string } | null = null;
+  if (isRecord(body.target)) {
+    const resolved = resolveMutationAnchor(route, doc.markdown, target, 'Suggestion anchor quote not found in document');
+    if (!resolved.ok) return resolved.result;
+    resolvedTarget = stabilizeAnchorTarget(resolved.logicalSource, resolved.normalizedTarget, resolved.resolved);
+    selectionMetadata = buildStoredSelectionMetadata(
+      doc.markdown,
+      resolved.resolved.selection,
+      quote || resolved.normalizedTarget.anchor,
+    );
+    quote = selectionMetadata.quote;
+  } else {
+    const normalizedMarkdown = normalizeQuote(doc.markdown);
+    const normalizedPlain = normalizeMarkdownForQuote(doc.markdown);
+    if (!normalizedMarkdown.includes(quote) && !normalizedPlain.includes(quote)) {
+      return {
+        status: 409,
+        body: { success: false, code: 'ANCHOR_NOT_FOUND', error: 'Suggestion anchor quote not found in document' },
+      };
+    }
+  }
+
   const requestedStatus = typeof body.status === 'string' ? body.status.trim().toLowerCase() : 'pending';
   if (requestedStatus !== 'pending' && requestedStatus !== '') {
     if (requestedStatus === 'accepted') {
@@ -901,6 +1791,7 @@ function addSuggestion(
   const id = randomUUID();
   const now = new Date().toISOString();
   const marks = parseMarks(doc.marks);
+  const anchor = quote ? findQuoteAnchorInMarkdown(doc.markdown, quote) : null;
   const providedRange = isRecord(body.range)
     && Number.isFinite(body.range.from)
     && Number.isFinite(body.range.to)
@@ -913,9 +1804,14 @@ function addSuggestion(
     createdAt: now,
     quote,
     status: 'pending',
+    ...(resolvedTarget ? { target: resolvedTarget } : {}),
     ...(kind !== 'delete' ? { content: body.content as string } : {}),
-    startRel: typeof body.startRel === 'string' && body.startRel.trim() ? body.startRel.trim() : `char:${anchor.strippedStart}`,
-    endRel: typeof body.endRel === 'string' && body.endRel.trim() ? body.endRel.trim() : `char:${anchor.strippedEnd}`,
+    startRel: typeof body.startRel === 'string' && body.startRel.trim()
+      ? body.startRel.trim()
+      : (selectionMetadata?.startRel ?? (anchor ? `char:${anchor.strippedStart}` : undefined)),
+    endRel: typeof body.endRel === 'string' && body.endRel.trim()
+      ? body.endRel.trim()
+      : (selectionMetadata?.endRel ?? (anchor ? `char:${anchor.strippedEnd}` : undefined)),
     ...(providedRange ? { range: providedRange } : {}),
   };
 
@@ -931,10 +1827,11 @@ function updateSuggestionStatus(
   slug: string,
   body: JsonRecord,
   status: 'accepted' | 'rejected',
+  context?: MutationReadyDocument | AsyncDocumentMutationContext,
 ): EngineExecutionResult {
-  const doc = getCanonicalReadableDocument(slug);
-  if (!doc) return { status: 404, body: { success: false, error: 'Document not found' } };
-  if (!isCanonicalReadMutationReady(doc)) return projectionStaleMutationResult();
+  const ready = resolveReadyDocument(slug, context);
+  if (ready.error) return ready.error;
+  const doc = ready.doc;
   const markId = typeof body.markId === 'string' ? body.markId : '';
   if (!markId) return { status: 400, body: { success: false, error: 'Missing markId' } };
 
@@ -957,6 +1854,7 @@ function updateSuggestionStatus(
     return { status: 404, body: { success: false, error: 'Mark not found' } };
   }
   const actor = typeof body.by === 'string' && body.by.trim() ? body.by.trim() : 'owner';
+  const asyncContext = context && 'doc' in context ? context : undefined;
   if (existing.status === status) {
     return {
       status: 200,
@@ -969,18 +1867,85 @@ function updateSuggestionStatus(
     };
   }
 
+  if (status !== 'rejected' && hasPotentiallyLiveCollabDoc(slug)) {
+    return {
+      status: 503,
+      body: {
+        success: false,
+        code: 'COLLAB_SYNC_REQUIRED',
+        error: 'Live collaborative state requires the async collab-aware suggestion mutation path',
+      },
+    };
+  }
+
+  const existingWithTarget = isRecord(existing.target) ? existing.target : null;
+  const existingForApply = existingWithTarget
+    ? (() => {
+        const parsedTarget = parseAnchorTarget(existing.target);
+        if (!parsedTarget.ok) return null;
+        const resolved = resolveMutationAnchor(
+          status === 'accepted' ? 'POST /marks/accept' : 'POST /marks/reject',
+          doc.markdown,
+          parsedTarget.target,
+          'Suggestion anchor quote not found in document',
+        );
+        if (!resolved.ok) return resolved;
+        const stabilizedTarget = stabilizeAnchorTarget(
+          resolved.logicalSource,
+          resolved.normalizedTarget,
+          resolved.resolved,
+        );
+        const selectionMetadata = buildStoredSelectionMetadata(
+          doc.markdown,
+          resolved.resolved.selection,
+          typeof existing.quote === 'string' ? existing.quote : resolved.normalizedTarget.anchor,
+        );
+        return {
+          ok: true as const,
+          mark: {
+            ...existing,
+            target: stabilizedTarget,
+            quote: selectionMetadata.quote,
+            ...(selectionMetadata.startRel ? { startRel: selectionMetadata.startRel } : {}),
+            ...(selectionMetadata.endRel ? { endRel: selectionMetadata.endRel } : {}),
+          },
+          resolvedSelection: resolved.resolved.selection,
+        };
+      })()
+    : { ok: true as const, mark: existing, resolvedSelection: null };
+
+  if (!existingForApply) {
+    return { status: 409, body: { success: false, code: 'ANCHOR_NOT_FOUND', error: 'Suggestion target metadata is invalid' } };
+  }
+  if ('result' in existingForApply) {
+    return existingForApply.result;
+  }
+
   const nextMarks: Record<string, StoredMark> = {
     ...marks,
-    [markId]: { ...existing, status },
+    [markId]: { ...existingForApply.mark, status },
   };
   let nextMarkdown = doc.markdown;
 
   if (status === 'accepted' && (existing.kind === 'insert' || existing.kind === 'delete' || existing.kind === 'replace')) {
-    const acceptedMarkdown = buildAcceptedSuggestionMarkdown(doc.markdown, existing);
+    const acceptedMarkdown = existingForApply.resolvedSelection
+      ? buildAcceptedSuggestionMarkdownFromSelection(doc.markdown, existingForApply.mark, existingForApply.resolvedSelection)
+      : buildAcceptedSuggestionMarkdown(doc.markdown, existingForApply.mark);
     if (acceptedMarkdown === null) {
       return { status: 409, body: { success: false, error: 'Cannot accept suggestion without quote anchor' } };
     }
-    nextMarkdown = acceptedMarkdown;
+    const deleteCleanupOffsets = existing.kind === 'delete'
+      ? (() => {
+          const quote = typeof existingForApply.mark.quote === 'string' ? existingForApply.mark.quote : '';
+          const span = quote ? findRawQuoteSpanInMarkdown(doc.markdown, quote) : null;
+          return span ? [span.start] : [];
+        })()
+      : [];
+    nextMarkdown = applyMutationCleanup(
+      'POST /marks/accept',
+      acceptedMarkdown,
+      deleteCleanupOffsets,
+    );
   }
 
   const ok = updateDocumentAtomic(
@@ -998,7 +1963,13 @@ function updateSuggestionStatus(
       },
     };
   }
-  const eventId = addDocumentEvent(slug, `suggestion.${status}`, { markId, status, by: actor }, actor);
+  const eventId = addDocumentEvent(
+    slug,
+    `suggestion.${status}`,
+    { markId, status, by: actor },
+    actor,
+    mutationContextIdempotencyKey(asyncContext),
+  );
   refreshSnapshotForSlug(slug);
   const updated = getDocumentBySlug(slug);
   const resolvedRevision = typeof updated?.revision === 'number' ? updated.revision : (doc.revision + 1);
@@ -1010,16 +1981,6 @@ function updateSuggestionStatus(
     // canonical DB state instead of reusing stale in-memory rooms on other instances.
     bumpDocumentAccessEpoch(slug);
     invalidateCollabDocument(slug);
-  } else {
-    const collabMarkdown = updated?.markdown ?? nextMarkdown;
-    void applyCanonicalDocumentToCollab(slug, {
-      markdown: collabMarkdown,
-      marks: nextMarks as unknown as Record<string, unknown>,
-      source: 'engine',
-    }).catch((error) => {
-      console.error('[document-engine] Failed to sync suggestion status to collab projection; invalidating collab state', { slug, status, error });
-      invalidateCollabDocument(slug);
-    });
   }
   if (updated) {
     void rebuildDocumentBlocks(updated, updated.markdown, updated.revision).catch((error) => {
@@ -1046,9 +2007,88 @@ async function addSuggestionAsync(
   kind: 'insert' | 'delete' | 'replace',
   context?: AsyncDocumentMutationContext,
 ): Promise<EngineExecutionResult> {
+  const ready = await getAsyncMutationReadyDocumentWithVisibleFallback(slug, context);
+  if (ready.error) return ready.error;
+  const doc = ready.doc;
   const requestedStatus = typeof body.status === 'string' ? body.status.trim().toLowerCase() : 'pending';
   if (!requestedStatus || requestedStatus === 'pending') {
-    return addSuggestion(slug, body, kind);
+    const route = `POST /marks/suggest-${kind}`;
+    const by = typeof body.by === 'string' && body.by.trim() ? body.by.trim() : 'ai:unknown';
+    let quote = normalizeQuote(body.quote);
+    if (!quote && isRecord(body.selector) && typeof body.selector.quote === 'string') {
+      quote = normalizeQuote(body.selector.quote);
+    }
+    let target: AnchorTarget | undefined;
+    if (isRecord(body.target)) {
+      const parsed = parseAnchorTarget(body.target);
+      if (!parsed.ok) return { status: 400, body: { success: false, error: parsed.error } };
+      target = parsed.target;
+    } else if (quote) {
+      target = buildImplicitLegacyTarget(quote);
+    }
+    if (!target) {
+      return { status: 400, body: { success: false, error: 'Missing quote' } };
+    }
+    if ((kind === 'insert' || kind === 'replace') && typeof body.content !== 'string') {
+      return { status: 400, body: { success: false, error: 'Missing content' } };
+    }
+
+    let resolvedTarget: AnchorTarget | undefined;
+    let selectionMetadata: { quote: string; startRel?: string; endRel?: string } | null = null;
+    if (isRecord(body.target)) {
+      const resolved = resolveMutationAnchor(route, doc.markdown, target, 'Suggestion anchor quote not found in document');
+      if (!resolved.ok) return resolved.result;
+      resolvedTarget = stabilizeAnchorTarget(resolved.logicalSource, resolved.normalizedTarget, resolved.resolved);
+      selectionMetadata = buildStoredSelectionMetadata(
+        doc.markdown,
+        resolved.resolved.selection,
+        quote || resolved.normalizedTarget.anchor,
+      );
+      quote = selectionMetadata.quote;
+    } else {
+      const normalizedMarkdown = normalizeQuote(doc.markdown);
+      const normalizedPlain = normalizeMarkdownForQuote(doc.markdown);
+      if (!normalizedMarkdown.includes(quote) && !normalizedPlain.includes(quote)) {
+        return {
+          status: 409,
+          body: { success: false, code: 'ANCHOR_NOT_FOUND', error: 'Suggestion anchor quote not found in document' },
+        };
+      }
+    }
+
+    const id = randomUUID();
+    const now = new Date().toISOString();
+    const marks = parseMarks(doc.marks);
+    const anchor = quote ? findQuoteAnchorInMarkdown(doc.markdown, quote) : null;
+    const providedRange = isRecord(body.range)
+      && Number.isFinite(body.range.from)
+      && Number.isFinite(body.range.to)
+      && Number(body.range.to) > Number(body.range.from)
+      ? { from: Number(body.range.from), to: Number(body.range.to) }
+      : null;
+    marks[id] = {
+      kind,
+      by,
+      createdAt: now,
+      quote,
+      status: 'pending',
+      ...(resolvedTarget ? { target: resolvedTarget } : {}),
+      ...(kind !== 'delete' ? { content: body.content as string } : {}),
+      startRel: typeof body.startRel === 'string' && body.startRel.trim()
+        ? body.startRel.trim()
+        : (selectionMetadata?.startRel ?? (anchor ? `char:${anchor.strippedStart}` : undefined)),
+      endRel: typeof body.endRel === 'string' && body.endRel.trim()
+        ? body.endRel.trim()
+        : (selectionMetadata?.endRel ?? (anchor ? `char:${anchor.strippedEnd}` : undefined)),
+      ...(providedRange ? { range: providedRange } : {}),
+    };
+
+    return persistMarksAsync(slug, doc, marks, by, `suggestion.${kind}.added`, {
+      markId: id,
+      by,
+      quote,
+      content: typeof body.content === 'string' ? body.content : undefined,
+    }, context);
   }
   if (requestedStatus !== 'accepted') {
     return {
@@ -1060,32 +2100,50 @@ async function addSuggestionAsync(
       },
     };
   }
-
-  const ready = getMutationReadyDocument(slug, context);
-  if (ready.error) return ready.error;
-  const doc = ready.doc;
   const by = typeof body.by === 'string' && body.by.trim() ? body.by.trim() : 'ai:unknown';
   let quote = normalizeQuote(body.quote);
   if (!quote && isRecord(body.selector) && typeof body.selector.quote === 'string') {
     quote = normalizeQuote(body.selector.quote);
   }
-  if (!quote) {
-    return { status: 400, body: { success: false, error: 'Missing quote' } };
+  let target: AnchorTarget | undefined;
+  if (isRecord(body.target)) {
+    const parsed = parseAnchorTarget(body.target);
+    if (!parsed.ok) return { status: 400, body: { success: false, error: parsed.error } };
+    target = parsed.target;
+  } else if (quote) {
+    target = buildImplicitLegacyTarget(quote);
   }
-  const anchor = findQuoteAnchorInMarkdown(doc.markdown, quote);
-  if (!anchor) {
-    return {
-      status: 409,
-      body: { success: false, code: 'ANCHOR_NOT_FOUND', error: 'Suggestion anchor quote not found in document' },
-    };
-  }
+  if (!target) return { status: 400, body: { success: false, error: 'Missing quote' } };
   if ((kind === 'insert' || kind === 'replace') && typeof body.content !== 'string') {
     return { status: 400, body: { success: false, error: 'Missing content' } };
+  }
+
+  let stabilizedTarget: AnchorTarget | undefined;
+  let selectionMetadata: { quote: string; startRel?: string; endRel?: string } | null = null;
+  if (isRecord(body.target)) {
+    const resolved = resolveMutationAnchor(`POST /marks/suggest-${kind}`, doc.markdown, target, 'Suggestion anchor quote not found in document');
+    if (!resolved.ok) return resolved.result;
+    stabilizedTarget = stabilizeAnchorTarget(resolved.logicalSource, resolved.normalizedTarget, resolved.resolved);
+    selectionMetadata = buildStoredSelectionMetadata(
+      doc.markdown,
+      resolved.resolved.selection,
+      quote || resolved.normalizedTarget.anchor,
+    );
+    quote = selectionMetadata.quote;
+  } else {
+    const anchorCheck = findQuoteAnchorInMarkdown(doc.markdown, quote);
+    if (!anchorCheck) {
+      return {
+        status: 409,
+        body: { success: false, code: 'ANCHOR_NOT_FOUND', error: 'Suggestion anchor quote not found in document' },
+      };
+    }
   }
 
   const id = randomUUID();
   const now = new Date().toISOString();
   const marks = parseMarks(doc.marks);
+  const anchor = quote ? findQuoteAnchorInMarkdown(doc.markdown, quote) : null;
   const providedRange = isRecord(body.range)
     && Number.isFinite(body.range.from)
     && Number.isFinite(body.range.to)
@@ -1098,9 +2156,14 @@ async function addSuggestionAsync(
     createdAt: now,
     quote,
     status: 'accepted',
+    ...(stabilizedTarget ? { target: stabilizedTarget } : {}),
     ...(kind !== 'delete' ? { content: body.content as string } : {}),
-    startRel: typeof body.startRel === 'string' && body.startRel.trim() ? body.startRel.trim() : `char:${anchor.strippedStart}`,
-    endRel: typeof body.endRel === 'string' && body.endRel.trim() ? body.endRel.trim() : `char:${anchor.strippedEnd}`,
+    startRel: typeof body.startRel === 'string' && body.startRel.trim()
+      ? body.startRel.trim()
+      : (selectionMetadata?.startRel ?? (anchor ? `char:${anchor.strippedStart}` : undefined)),
+    endRel: typeof body.endRel === 'string' && body.endRel.trim()
+      ? body.endRel.trim()
+      : (selectionMetadata?.endRel ?? (anchor ? `char:${anchor.strippedEnd}` : undefined)),
     ...(providedRange ? { range: providedRange } : {}),
   };
 
@@ -1122,7 +2185,7 @@ async function addSuggestionAsync(
     nextMarkdown: structuredAccepted.markdown,
     nextMarks: structuredAccepted.marks as unknown as Record<string, unknown>,
     source: `engine:suggestion.add.accepted:${by}`,
-    baseRevision: doc.revision,
+    ...buildCanonicalMutationBaseArgs(doc, context),
     strictLiveDoc: true,
     guardPathologicalGrowth: true,
   });
@@ -1138,7 +2201,14 @@ async function addSuggestionAsync(
     };
   }
 
-  const eventId = addDocumentEvent(slug, 'suggestion.accepted', { markId: id, status: 'accepted', by }, by);
+  const eventId = addDocumentEvent(
+    slug,
+    'suggestion.accepted',
+    { markId: id, status: 'accepted', by },
+    by,
+    mutationContextIdempotencyKey(context),
+    mutationContextIdempotencyRoute(context),
+  );
   upsertMarkTombstone(slug, id, 'accepted', mutation.document.revision);
   return {
     status: 200,
@@ -1162,7 +2232,7 @@ async function updateSuggestionStatusAsync(
   status: 'accepted' | 'rejected',
   context?: AsyncDocumentMutationContext,
 ): Promise<EngineExecutionResult> {
-  const ready = getMutationReadyDocument(slug, context);
+  const ready = await getAsyncMutationReadyDocumentWithVisibleFallback(slug, context);
   if (ready.error) return ready.error;
   const doc = ready.doc;
   const markId = typeof body.markId === 'string' ? body.markId : '';
@@ -1201,16 +2271,139 @@ async function updateSuggestionStatusAsync(
   }
 
   if (existing.kind !== 'insert' && existing.kind !== 'delete' && existing.kind !== 'replace') {
-    return updateSuggestionStatus(slug, body, status);
+    const nextMarks: Record<string, StoredMark> = {
+      ...marks,
+      [markId]: { ...existing, status },
+    };
+    const result = await persistMarksAsync(
+      slug,
+      doc,
+      nextMarks,
+      actor,
+      `suggestion.${status}`,
+      { markId, status, by: actor },
+      context,
+    );
+    if (result.status >= 200 && result.status < 300) {
+      const updated = getDocumentBySlug(slug);
+      const resolvedRevision = typeof updated?.revision === 'number' ? updated.revision : (doc.revision + 1);
+      upsertMarkTombstone(slug, markId, status, resolvedRevision);
+      if (status === 'rejected') {
+        if ((updated?.access_epoch ?? doc.access_epoch) === doc.access_epoch) {
+          bumpDocumentAccessEpoch(slug);
+        }
+        invalidateCollabDocument(slug);
+      }
+    }
+    return result;
+  }
+
+  let marksForRehydration = marks;
+  if (isRecord(existing.target)) {
+    const parsedTarget = parseAnchorTarget(existing.target);
+    if (!parsedTarget.ok) {
+      return { status: 409, body: { success: false, code: 'ANCHOR_NOT_FOUND', error: 'Suggestion target metadata is invalid' } };
+    }
+    const resolved = resolveMutationAnchor(
+      status === 'accepted' ? 'POST /marks/accept' : 'POST /marks/reject',
+      doc.markdown,
+      parsedTarget.target,
+      'Suggestion anchor quote not found in document',
+    );
+    if (!resolved.ok) return resolved.result;
+    const stabilizedTarget = stabilizeAnchorTarget(
+      resolved.logicalSource,
+      resolved.normalizedTarget,
+      resolved.resolved,
+    );
+    const selectionMetadata = buildStoredSelectionMetadata(
+      doc.markdown,
+      resolved.resolved.selection,
+      typeof existing.quote === 'string' ? existing.quote : resolved.normalizedTarget.anchor,
+    );
+    marksForRehydration = {
+      ...marks,
+      [markId]: {
+        ...existing,
+        target: stabilizedTarget,
+        quote: selectionMetadata.quote,
+        ...(selectionMetadata.startRel ? { startRel: selectionMetadata.startRel } : {}),
+        ...(selectionMetadata.endRel ? { endRel: selectionMetadata.endRel } : {}),
+      },
+    };
   }
 
   const structuredResult = await finalizeSuggestionThroughRehydration({
     markdown: doc.markdown,
-    marks,
+    marks: marksForRehydration,
     markId,
     action: status === 'accepted' ? 'accept' : 'reject',
   });
   if (!structuredResult.ok) {
+    if (
+      status === 'rejected'
+      && structuredResult.code === 'MARK_NOT_HYDRATED'
+      && canRejectSuggestionWithoutHydration(doc.markdown, existing)
+    ) {
+      const nextMarks = { ...marks };
+      delete nextMarks[markId];
+      const mutation = await mutateCanonicalDocument({
+        slug,
+        nextMarkdown: doc.markdown,
+        nextMarks: nextMarks as unknown as Record<string, unknown>,
+        source: `engine:${status}:${actor}:fallback`,
+        baseRevision: doc.revision,
+        strictLiveDoc: true,
+        guardPathologicalGrowth: true,
+      });
+      if (!mutation.ok) {
+        return {
+          status: mutation.status,
+          body: {
+            success: false,
+            code: mutation.code,
+            error: mutation.error,
+            ...(mutation.retryWithState ? { retryWithState: mutation.retryWithState } : {}),
+          },
+        };
+      }
+
+      const eventId = addDocumentEvent(
+        slug,
+        `suggestion.${status}`,
+        { markId, status, by: actor },
+        actor,
+        mutationContextIdempotencyKey(context),
+        mutationContextIdempotencyRoute(context),
+      );
+      upsertMarkTombstone(slug, markId, status, mutation.document.revision);
+      const updatedMarks = parseMarks(mutation.document.marks);
+      const responseMarks: Record<string, StoredMark> = {
+        ...updatedMarks,
+        [markId]: {
+          ...existing,
+          ...(updatedMarks[markId] ?? {}),
+          status,
+        },
+      };
+      if ((mutation.document.access_epoch ?? doc.access_epoch) === doc.access_epoch) {
+        bumpDocumentAccessEpoch(slug);
+      }
+      invalidateCollabDocument(slug);
+
+      return {
+        status: 200,
+        body: {
+          success: true,
+          eventId,
+          shareState: mutation.document.share_state,
+          updatedAt: mutation.document.updated_at,
+          content: mutation.document.markdown,
+          markdown: mutation.document.markdown,
+          marks: responseMarks,
+        },
+      };
+    }
     return toStructuredMutationFailureResult(structuredResult, 'Suggestion anchor quote not found in document');
   }
 
@@ -1219,7 +2412,7 @@ async function updateSuggestionStatusAsync(
     nextMarkdown: structuredResult.markdown,
     nextMarks: structuredResult.marks as unknown as Record<string, unknown>,
     source: `engine:${status}:${actor}`,
-    baseRevision: doc.revision,
+    ...buildCanonicalMutationBaseArgs(doc, context),
     strictLiveDoc: true,
     guardPathologicalGrowth: true,
   });
@@ -1235,9 +2428,30 @@ async function updateSuggestionStatusAsync(
     };
   }
 
-  const eventId = addDocumentEvent(slug, `suggestion.${status}`, { markId, status, by: actor }, actor);
+  const eventId = addDocumentEvent(
+    slug,
+    `suggestion.${status}`,
+    { markId, status, by: actor },
+    actor,
+    mutationContextIdempotencyKey(context),
+    mutationContextIdempotencyRoute(context),
+  );
   upsertMarkTombstone(slug, markId, status, mutation.document.revision);
   const updatedMarks = parseMarks(mutation.document.marks);
+  const responseMarks: Record<string, StoredMark> = {
+    ...updatedMarks,
+    [markId]: {
+      ...existing,
+      ...(updatedMarks[markId] ?? {}),
+      status,
+    },
+  };
+  if (status === 'rejected') {
+    if ((mutation.document.access_epoch ?? doc.access_epoch) === doc.access_epoch) {
+      bumpDocumentAccessEpoch(slug);
+    }
+    invalidateCollabDocument(slug);
+  }
 
   return {
     status: 200,
@@ -1248,13 +2462,17 @@ async function updateSuggestionStatusAsync(
       updatedAt: mutation.document.updated_at,
       content: mutation.document.markdown,
       markdown: mutation.document.markdown,
-      marks: updatedMarks,
+      marks: responseMarks,
     },
   };
 }
 
-function resolveComment(slug: string, body: JsonRecord): EngineExecutionResult {
-  const ready = getMutationReadyDocument(slug);
+function resolveComment(
+  slug: string,
+  body: JsonRecord,
+  context?: MutationReadyDocument | AsyncDocumentMutationContext,
+): EngineExecutionResult {
+  const ready = resolveReadyDocument(slug, context);
   if (ready.error) return ready.error;
   const doc = ready.doc;
   const markId = typeof body.markId === 'string' ? body.markId : '';
@@ -1274,8 +2492,37 @@ function resolveComment(slug: string, body: JsonRecord): EngineExecutionResult {
   return result;
 }
 
-function unresolveComment(slug: string, body: JsonRecord): EngineExecutionResult {
-  const ready = getMutationReadyDocument(slug);
+async function resolveCommentAsync(
+  slug: string,
+  body: JsonRecord,
+  context?: AsyncDocumentMutationContext,
+): Promise<EngineExecutionResult> {
+  const ready = await getMutationReadyDocumentAsync(slug, context);
+  if (ready.error) return ready.error;
+  const doc = ready.doc;
+  const markId = typeof body.markId === 'string' ? body.markId : '';
+  if (!markId) return { status: 400, body: { success: false, error: 'Missing markId' } };
+
+  const marks = parseMarks(doc.marks);
+  const existing = marks[markId];
+  if (!existing) return { status: 404, body: { success: false, error: 'Mark not found' } };
+  marks[markId] = { ...existing, resolved: true };
+  const actor = typeof body.by === 'string' && body.by.trim() ? body.by.trim() : 'owner';
+  const result = await persistMarksAsync(slug, doc, marks, actor, 'comment.resolved', { markId, by: actor }, context);
+  if (result.status >= 200 && result.status < 300) {
+    const updated = getDocumentBySlug(slug);
+    const resolvedRevision = typeof updated?.revision === 'number' ? updated.revision : (doc.revision + 1);
+    upsertMarkTombstone(slug, markId, 'resolved', resolvedRevision);
+  }
+  return result;
+}
+
+function unresolveComment(
+  slug: string,
+  body: JsonRecord,
+  context?: MutationReadyDocument | AsyncDocumentMutationContext,
+): EngineExecutionResult {
+  const ready = resolveReadyDocument(slug, context);
   if (ready.error) return ready.error;
   const doc = ready.doc;
   const markId = typeof body.markId === 'string' ? body.markId : '';
@@ -1289,8 +2536,31 @@ function unresolveComment(slug: string, body: JsonRecord): EngineExecutionResult
   return persistMarks(slug, marks, actor, 'comment.unresolved', { markId, by: actor });
 }
 
-function replyComment(slug: string, body: JsonRecord): EngineExecutionResult {
-  const ready = getMutationReadyDocument(slug);
+async function unresolveCommentAsync(
+  slug: string,
+  body: JsonRecord,
+  context?: AsyncDocumentMutationContext,
+): Promise<EngineExecutionResult> {
+  const ready = await getMutationReadyDocumentAsync(slug, context);
+  if (ready.error) return ready.error;
+  const doc = ready.doc;
+  const markId = typeof body.markId === 'string' ? body.markId : '';
+  if (!markId) return { status: 400, body: { success: false, error: 'Missing markId' } };
+
+  const marks = parseMarks(doc.marks);
+  const existing = marks[markId];
+  if (!existing) return { status: 404, body: { success: false, error: 'Mark not found' } };
+  marks[markId] = { ...existing, resolved: false };
+  const actor = typeof body.by === 'string' && body.by.trim() ? body.by.trim() : 'owner';
+  return persistMarksAsync(slug, doc, marks, actor, 'comment.unresolved', { markId, by: actor }, context);
+}
+
+function replyComment(
+  slug: string,
+  body: JsonRecord,
+  context?: MutationReadyDocument | AsyncDocumentMutationContext,
+): EngineExecutionResult {
+  const ready = resolveReadyDocument(slug, context);
   if (ready.error) return ready.error;
   const doc = ready.doc;
   const markId = typeof body.markId === 'string' ? body.markId : '';
@@ -1315,7 +2585,33 @@ function replyComment(slug: string, body: JsonRecord): EngineExecutionResult {
   return result;
 }
 
-function rewriteDocument(slug: string, body: JsonRecord): EngineExecutionResult {
+async function replyCommentAsync(
+  slug: string,
+  body: JsonRecord,
+  context?: AsyncDocumentMutationContext,
+): Promise<EngineExecutionResult> {
+  const ready = await getMutationReadyDocumentAsync(slug, context);
+  if (ready.error) return ready.error;
+  const doc = ready.doc;
+  const markId = typeof body.markId === 'string' ? body.markId : '';
+  const by = typeof body.by === 'string' && body.by.trim() ? body.by.trim() : 'ai:unknown';
+  const text = typeof body.text === 'string' ? body.text : '';
+  if (!markId || !text.trim()) return { status: 400, body: { success: false, error: 'Missing markId/text' } };
+
+  const marks = parseMarks(doc.marks);
+  const existing = marks[markId];
+  if (!existing) return { status: 404, body: { success: false, error: 'Mark not found' } };
+  const threadReplies = Array.isArray(existing.thread)
+    ? existing.thread as Array<{ by: string; text: string; at: string }>
+    : [];
+  const normalizedReplies = Array.isArray(existing.replies) ? existing.replies : [];
+  const baseReplies = normalizedReplies.length >= threadReplies.length ? normalizedReplies : threadReplies;
+  const replies = [...baseReplies, { by, text, at: new Date().toISOString() }];
+  marks[markId] = { ...existing, thread: replies, replies, threadId: existing.threadId ?? markId };
+  return persistMarksAsync(slug, doc, marks, by, 'comment.replied', { markId, by, text }, context);
+}
+
+function rewriteDocument(_slug: string, _body: JsonRecord): EngineExecutionResult {
   return {
     status: 501,
     body: {
@@ -1364,6 +2660,15 @@ export async function executeDocumentOperationAsync(
   body: JsonRecord = {},
   context?: AsyncDocumentMutationContext,
 ): Promise<EngineExecutionResult> {
+  if (method === 'GET' && routePath === '/state') {
+    return readStateAsync(slug);
+  }
+  if (method === 'GET' && routePath === '/marks') {
+    return readMarksAsync(slug);
+  }
+  if (method === 'POST' && routePath === '/marks/comment') {
+    return addCommentAsync(slug, body, context);
+  }
   if (method === 'POST' && routePath === '/marks/suggest-replace') {
     return addSuggestionAsync(slug, body, 'replace', context);
   }
@@ -1378,6 +2683,15 @@ export async function executeDocumentOperationAsync(
   }
   if (method === 'POST' && routePath === '/marks/reject') {
     return updateSuggestionStatusAsync(slug, body, 'rejected', context);
+  }
+  if (method === 'POST' && routePath === '/marks/resolve') {
+    return resolveCommentAsync(slug, body, context);
+  }
+  if (method === 'POST' && routePath === '/marks/unresolve') {
+    return unresolveCommentAsync(slug, body, context);
+  }
+  if (method === 'POST' && routePath === '/marks/reply') {
+    return replyCommentAsync(slug, body, context);
   }
   return executeDocumentOperation(slug, method, routePath, body);
 }

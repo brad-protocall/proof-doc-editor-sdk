@@ -146,6 +146,7 @@ import { initThemePicker, getThemePicker } from '../ui/theme-picker';
 import { fileClient } from '../bridge/file-client';
 import { shareClient, type CollabSessionInfo, type SharePendingEvent } from '../bridge/share-client';
 import { collabClient, type CollabSyncStatus } from '../bridge/collab-client';
+import { shouldDeferShareMarksRefresh } from './share-marks-refresh';
 import { collabCursorBuilder, collabSelectionBuilder } from './plugins/collab-cursors';
 import { isAgentScopedId } from '../shared/agent-identity';
 import {
@@ -170,6 +171,11 @@ import { normalizeQuote, extractMarks, embedMarks, getThread, migrateProvenanceT
 import { proofMarkHandler } from '../formats/remark-proof-marks';
 import { remarkProofMarksPlugin } from './schema/remark-proof-marks-plugin';
 import { getCurrentActor, setCurrentActor as setCurrentActorValue, normalizeActor } from './actor';
+import {
+  shouldKeepalivePersistShareContent,
+  shouldKeepalivePersistShareMarks,
+  shouldUseLocalKeepaliveBaseToken,
+} from './share-refresh-persist';
 import { keybindingsPlugin, setShowAgentInputCallback, type AgentInputContext } from './plugins/keybindings';
 import { tableKeyboardPlugin } from './plugins/table-keyboard';
 import { showAgentInputDialog } from '../ui/agent-input-dialog';
@@ -1073,6 +1079,8 @@ class ProofEditorImpl implements ProofEditor {
   private shareEventCursor: number = 0;
   private shareLastForcedCollabEventId: number = 0;
   private shareDocumentUpdatedTimer: ReturnType<typeof setTimeout> | null = null;
+  private shareMarksRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  private pendingShareMarksRefresh: boolean = false;
   private pendingCommentDraftRestoreTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingCommentDraftSnapshot: CommentPopoverDraftSnapshot | null = null;
   private shareAgentPresenceSummary: string = '';
@@ -1281,7 +1289,8 @@ class ProofEditorImpl implements ProofEditor {
 
     window.addEventListener('beforeunload', () => {
       if (this.isShareMode) {
-        this.flushShareMarks({ keepalive: true });
+        this.flushShareMarks({ keepalive: true, persistContent: true });
+        collabClient.flushPendingLocalStateForUnload();
       }
       this.clearPendingCommentDraftRestore();
       if (this.collabRefreshTimer) {
@@ -1301,9 +1310,17 @@ class ProofEditorImpl implements ProofEditor {
       this.cleanupNavigation?.();
     });
 
+    window.addEventListener('pagehide', () => {
+      if (this.isShareMode) {
+        this.flushShareMarks({ keepalive: true, persistContent: true });
+        collabClient.flushPendingLocalStateForUnload();
+      }
+    });
+
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'hidden' && this.isShareMode) {
-        this.flushShareMarks({ keepalive: true });
+        this.flushShareMarks({ keepalive: true, persistContent: true });
+        collabClient.flushPendingLocalStateForUnload();
       }
     });
   }
@@ -1673,6 +1690,11 @@ class ProofEditorImpl implements ProofEditor {
       clearTimeout(this.shareDocumentUpdatedTimer);
       this.shareDocumentUpdatedTimer = null;
     }
+    if (this.shareMarksRefreshTimer) {
+      clearTimeout(this.shareMarksRefreshTimer);
+      this.shareMarksRefreshTimer = null;
+    }
+    this.pendingShareMarksRefresh = false;
     this.clearPendingCommentDraftRestore();
     if (this.shareWsUnsubscribe) {
       this.shareWsUnsubscribe();
@@ -2576,7 +2598,16 @@ class ProofEditorImpl implements ProofEditor {
       && this.collabIsSynced;
   }
 
+  private isMarksPendingShareEvent(event: SharePendingEvent): boolean {
+    return event.type.startsWith('comment.')
+      || event.type.startsWith('suggestion.');
+  }
+
   private handlePendingShareEvent(event: SharePendingEvent): void {
+    if (this.isMarksPendingShareEvent(event)) {
+      this.scheduleShareMarksRefresh();
+      return;
+    }
     if (!this.shouldForceCollabRefreshFromPendingEvent(event)) return;
     if (event.id <= this.shareLastForcedCollabEventId) return;
     this.shareLastForcedCollabEventId = event.id;
@@ -2649,6 +2680,43 @@ class ProofEditorImpl implements ProofEditor {
         })
         .catch(() => {
           // best-effort refresh
+        });
+    }, this.shareDocumentUpdatedDebounceMs);
+  }
+
+  private scheduleShareMarksRefresh(): void {
+    this.pendingShareMarksRefresh = true;
+    if (this.shareMarksRefreshTimer) {
+      clearTimeout(this.shareMarksRefreshTimer);
+      this.shareMarksRefreshTimer = null;
+    }
+    this.shareMarksRefreshTimer = setTimeout(() => {
+      this.shareMarksRefreshTimer = null;
+      if (!this.pendingShareMarksRefresh) return;
+      if (!this.isShareMode || !this.collabEnabled) {
+        this.pendingShareMarksRefresh = false;
+        return;
+      }
+      if (shouldDeferShareMarksRefresh({
+        collabCanEdit: this.collabCanEdit,
+        collabUnsyncedChanges: this.collabUnsyncedChanges,
+        collabPendingLocalUpdates: this.collabPendingLocalUpdates,
+      })) {
+        this.scheduleShareMarksRefresh();
+        return;
+      }
+      this.pendingShareMarksRefresh = false;
+      void shareClient.fetchOpenContext()
+        .then((context) => {
+          if (!context || this.isShareRequestError(context) || !('doc' in context)) return;
+          const serverMarks = (context.doc?.marks && typeof context.doc.marks === 'object' && !Array.isArray(context.doc.marks))
+            ? context.doc.marks as Record<string, StoredMark>
+            : null;
+          if (!serverMarks) return;
+          this.applyAuthoritativeShareMarks(serverMarks);
+        })
+        .catch(() => {
+          // best-effort refresh for server-originated mark updates
         });
     }, this.shareDocumentUpdatedDebounceMs);
   }
@@ -3340,7 +3408,7 @@ class ProofEditorImpl implements ProofEditor {
 
     const wordmark = document.createElement('a');
     wordmark.textContent = 'Proof';
-    wordmark.href = 'https://proof.com';
+    wordmark.href = 'https://www.proofeditor.ai';
     wordmark.target = '_blank';
     wordmark.rel = 'noopener';
     wordmark.style.cssText = 'display:inline-flex;align-items:center;justify-content:center;min-height:44px;min-width:44px;padding:0 8px;border-radius:10px;font-weight:600;color:#333;font-size:13px;letter-spacing:-0.2px;flex-shrink:0;text-decoration:none;';
@@ -4589,6 +4657,11 @@ class ProofEditorImpl implements ProofEditor {
       clearTimeout(this.shareDocumentUpdatedTimer);
       this.shareDocumentUpdatedTimer = null;
     }
+    if (this.shareMarksRefreshTimer) {
+      clearTimeout(this.shareMarksRefreshTimer);
+      this.shareMarksRefreshTimer = null;
+    }
+    this.pendingShareMarksRefresh = false;
     const existing = document.getElementById('share-banner');
     if (!existing) return;
     existing.remove();
@@ -4691,7 +4764,7 @@ class ProofEditorImpl implements ProofEditor {
     });
   }
 
-  private flushShareMarks(_options?: { keepalive?: boolean }): void {
+  private flushShareMarks(_options?: { keepalive?: boolean; persistContent?: boolean }): void {
     if (!this.isShareMode || !this.editor || this.suppressMarksSync) return;
     if (!this.initialMarksSynced) return;
     this.editor.action((ctx) => {
@@ -4703,9 +4776,50 @@ class ProofEditorImpl implements ProofEditor {
         this.initialMarksSynced = true;
         const serializer = ctx.get(serializerCtx);
         const markdown = this.normalizeMarkdownForRuntime(serializer(view.state.doc));
+        const shouldPersistContent = shouldKeepalivePersistShareContent({
+          keepalive: Boolean(_options?.keepalive),
+          persistContent: _options?.persistContent,
+          collabEnabled: this.collabEnabled,
+          collabCanEdit: this.collabCanEdit,
+          hasCompletedInitialCollabHydration: this.hasCompletedInitialCollabHydration,
+          hasLocalContentEditSinceHydration: this.hasLocalContentEditSinceHydration,
+          collabConnectionStatus: this.collabConnectionStatus,
+          collabIsSynced: this.collabIsSynced,
+          collabUnsyncedChanges: this.collabUnsyncedChanges,
+          collabPendingLocalUpdates: this.collabPendingLocalUpdates,
+          markdown,
+        });
+        const shouldPersistMarks = shouldKeepalivePersistShareMarks({
+          keepalive: Boolean(_options?.keepalive),
+          collabEnabled: this.collabEnabled,
+          collabCanEdit: this.collabCanEdit,
+          hasCompletedInitialCollabHydration: this.hasCompletedInitialCollabHydration,
+          hasLocalContentEditSinceHydration: this.hasLocalContentEditSinceHydration,
+          collabUnsyncedChanges: this.collabUnsyncedChanges,
+          collabPendingLocalUpdates: this.collabPendingLocalUpdates,
+        });
         if (this.collabEnabled && this.collabCanEdit) {
           this.publishProjectionMarkdown(view, markdown, 'marks-flush');
           collabClient.setMarksMetadata(metadata);
+        }
+        if (shouldPersistContent) {
+          const allowLocalKeepaliveBaseToken = shouldUseLocalKeepaliveBaseToken({
+            keepalive: Boolean(_options?.keepalive),
+            collabEnabled: this.collabEnabled,
+            collabCanEdit: this.collabCanEdit,
+            hasCompletedInitialCollabHydration: this.hasCompletedInitialCollabHydration,
+            collabIsSynced: this.collabIsSynced,
+            collabUnsyncedChanges: this.collabUnsyncedChanges,
+            collabPendingLocalUpdates: this.collabPendingLocalUpdates,
+          });
+          void shareClient.pushUpdate(markdown, metadata, getCurrentActor(), {
+            keepalive: Boolean(_options?.keepalive),
+            allowLocalKeepaliveBaseToken,
+          });
+          return;
+        }
+        if (!shouldPersistMarks) {
+          return;
         }
         if (!this.collabEnabled || !this.collabCanEdit || LEGACY_REST_FALLBACK) {
           void shareClient.pushMarks(metadata, getCurrentActor(), { keepalive: Boolean(_options?.keepalive) });
